@@ -1,0 +1,134 @@
+# Linux + macOS build/test lanes (docs/11 TD-04, docs/15 §12.1).
+#
+# Every push / PR: release, asan, tsan on Ubuntu 24.04 (GCC), release on
+# Ubuntu (Clang) and macOS (Apple clang, Homebrew FFmpeg 9) -- all running the
+# regular suite (ctest -LE stress).
+# Nightly: the contention stress suite (ctest -L stress) on the Linux
+# release and tsan trees.
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "17 18 * * *"   # 02:17 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      stress:
+        description: "run the stress suite instead of the regular one"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORT_VERSION: "1.30.0"
+
+jobs:
+  linux:
+    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.stress)
+    name: linux-${{ matrix.compiler }}-${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: gcc,   lane: release, cc: gcc,   cxx: g++ }
+          - { compiler: gcc,   lane: asan,    cc: gcc,   cxx: g++ }
+          - { compiler: gcc,   lane: tsan,    cc: gcc,   cxx: g++ }
+          - { compiler: clang, lane: release, cc: clang, cxx: clang++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      PKG_CONFIG_PATH: /opt/onnxruntime/lib/pkgconfig
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: /opt/onnxruntime
+          key: ort-linux-x64-${{ env.ORT_VERSION }}
+      - name: Cache test model
+        uses: actions/cache@v4
+        with:
+          path: build/models
+          key: models-mobilenetv2-12
+      - name: Install dependencies
+        run: sh ci/setup-ubuntu.sh
+      - name: Build and test
+        run: sh ci/build.sh ${{ matrix.lane }} regular
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-linux-${{ matrix.compiler }}-${{ matrix.lane }}
+          path: build/ci-${{ matrix.lane }}/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  macos:
+    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.stress)
+    name: macos-release
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache test model
+        uses: actions/cache@v4
+        with:
+          path: build/models
+          key: models-mobilenetv2-12
+      - name: Install dependencies
+        run: brew install cmake ninja pkgconf googletest ffmpeg onnxruntime
+      - name: Build and test
+        run: sh ci/build.sh release regular
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-macos-release
+          path: build/ci-release/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  stress:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.stress)
+    name: stress-linux-gcc-${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [release, tsan]
+    env:
+      CC: gcc
+      CXX: g++
+      PKG_CONFIG_PATH: /opt/onnxruntime/lib/pkgconfig
+      GE_STRESS_LOG_DIR: ${{ github.workspace }}/build/stress-logs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: /opt/onnxruntime
+          key: ort-linux-x64-${{ env.ORT_VERSION }}
+      - name: Cache test model
+        uses: actions/cache@v4
+        with:
+          path: build/models
+          key: models-mobilenetv2-12
+      - name: Install dependencies
+        run: sh ci/setup-ubuntu.sh
+      - name: Build and stress
+        run: sh ci/build.sh ${{ matrix.lane }} stress
+      - name: Upload stress logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-linux-gcc-${{ matrix.lane }}
+          path: |
+            build/ci-${{ matrix.lane }}/Testing/Temporary/LastTest.log
+            build/stress-logs/
+          if-no-files-found: ignore

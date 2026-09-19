@@ -1,0 +1,136 @@
+classDiagram
+  class Engine {
+    +LoadPlugin()
+    +CreateSession()
+    +UpgradeOperator()
+  }
+  class Session {
+    +Start()
+    +Apply(Mutation)
+    +SetParameters()
+    +Snapshot()
+  }
+  class MutationCoordinator {
+    +Submit()
+    +Prepare()
+    +Publish()
+    +Retire()
+  }
+  class RuntimeTopology {
+    +version
+    +nodes
+    +edges
+    +routes
+  }
+  class NodeRuntime {
+    +operator_key
+    +parameters
+    +TrySchedule()
+    +BeginInvoke()
+  }
+  class EdgeChannel {
+    +contract
+    +Push()
+    +Pop()
+  }
+  class Scheduler {
+    +MarkReady()
+    +Dispatch()
+  }
+  class PacketRouter {
+    +Emit()
+  }
+  class AsyncRuntime {
+    +OnCompletion()
+    +DeliverOrDrop()
+  }
+  class Batcher {
+    +Enqueue()
+    +FlushDue()
+  }
+  class CapabilityNegotiator {
+    +NegotiateEdge()
+    +NegotiateFanout()
+  }
+  class ResourceManager {
+    +Reserve()
+    +Commit()
+    +Release()
+  }
+  class PluginRegistry {
+    +Load()
+    +Resolve()
+    +Retire()
+  }
+  class OperationRegistry {
+    +Create()
+    +Transition()
+  }
+  class SessionManager {
+    +Create()
+    +Destroy()
+    +Find()
+  }
+  class CompletionQueue {
+    +Push()
+    +DrainTo()
+  }
+  class ReorderBuffer {
+    +Insert()
+    +AdvanceDeadline()
+  }
+  class InputBinding {
+    +TryAcquire()
+    +OnPacket()
+  }
+  class ParameterStore {
+    +Submit()
+    +SwitchAtPacketBoundary()
+  }
+  class HostApiAdapter {
+    +kVtable
+    +Bind()
+  }
+  class EventBus {
+    +Publish()
+    +Subscribe()
+  }
+  class AuditLog {
+    +Append()
+  }
+  class MetricsRegistry {
+    +ExportPrometheus()
+  }
+
+  Engine *-- PluginRegistry
+  Engine *-- ResourceManager
+  Engine *-- Scheduler
+  Engine *-- AsyncRuntime
+  Engine *-- OperationRegistry
+  Engine *-- SessionManager
+  Engine *-- EventBus
+  Engine *-- AuditLog
+  Engine *-- MetricsRegistry
+  SessionManager o-- Session
+  Session *-- MutationCoordinator
+  Session --> RuntimeTopology : atomic current
+  MutationCoordinator --> CapabilityNegotiator
+  MutationCoordinator --> ResourceManager
+  MutationCoordinator --> PluginRegistry
+  MutationCoordinator --> OperationRegistry
+  RuntimeTopology *-- NodeRuntime
+  RuntimeTopology *-- EdgeChannel
+  RuntimeTopology *-- InputBinding
+  NodeRuntime *-- ParameterStore
+  NodeRuntime *-- HostApiAdapter
+  HostApiAdapter --> PacketRouter
+  HostApiAdapter --> CompletionQueue
+  HostApiAdapter --> EventBus
+  Scheduler --> NodeRuntime
+  Scheduler --> InputBinding
+  Scheduler --> PacketRouter
+  PacketRouter --> EdgeChannel
+  AsyncRuntime *-- CompletionQueue
+  AsyncRuntime *-- ReorderBuffer
+  AsyncRuntime --> Batcher
+  AsyncRuntime --> PacketRouter

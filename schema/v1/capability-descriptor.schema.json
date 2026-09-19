@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ge.dev/schema/capability/v1",
+  "title": "CapabilityDescriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "operator", "ports", "execution", "resources"],
+  "properties": {
+    "kind": {"const": "CapabilityDescriptor"},
+    "schema_version": {"const": 1},
+    "$id": {"type": "string"},
+    "operator": {"type": "string", "minLength": 1},
+    "description": {"type": "string"},
+    "ports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputs", "outputs"],
+      "properties": {
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/port"}},
+        "outputs": {"type": "array", "items": {"$ref": "#/$defs/port"}}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["devices", "stateful", "async", "max_parallelism", "zero_copy"],
+      "properties": {
+        "devices": {"type": "array", "minItems": 1, "items": {"enum": ["cpu", "gpu"]}},
+        "stateful": {"type": "boolean"},
+        "async": {"type": "boolean"},
+        "max_parallelism": {"type": "integer", "minimum": 1},
+        "zero_copy": {"type": "boolean"}
+      }
+    },
+    "parameters": {"type": "object"},
+    "resources": {"type": "object"},
+    "events": {"type": "object"}
+  },
+  "$defs": {
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type_tag", "cardinality"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$"},
+        "type_tag": {"type": "string", "minLength": 1},
+        "required": {"type": "boolean", "default": true},
+        "cardinality": {"enum": ["single", "multi"]},
+        "dynamic_consumers": {"type": "boolean", "default": false},
+        "video": {"type": "object"},
+        "audio": {"type": "object"},
+        "tensor": {"type": "object"},
+        "memory": {"type": "object"}
+      }
+    }
+  }
+}

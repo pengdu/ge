@@ -1,0 +1,27 @@
+sequenceDiagram
+  participant C as Caller
+  participant S as Session
+  participant M as MutationCoordinator
+  participant V as Validator
+  participant N as CapabilityNegotiator
+  participant R as ResourceManager
+  participant P as PluginRegistry
+  participant T as RuntimeTopology
+  participant D as DataPlane
+
+  C->>S: Apply patch
+  S->>M: Submit operation
+  M->>T: Read current Vn
+  M->>V: Validate candidate spec
+  V-->>M: Valid
+  M->>N: Negotiate changed edges
+  N-->>M: Connection contracts
+  M->>R: Reserve resources
+  R-->>M: Resource lease
+  M->>P: Create and open new nodes
+  P-->>M: Warmed node runtimes
+  M->>S: CAS publish Vn plus 1
+  S-->>D: New packets use Vn plus 1
+  M->>M: Drain or fast retire Vn
+  M->>R: Release retired leases
+  M-->>C: Operation succeeded

@@ -1,0 +1,55 @@
+flowchart TD
+  A[Invoke: EnterBusy] --> B{state ∈ ready/running?}
+  B -- 否 --> X[CancelSchedule → 返回]
+  B -- 是 --> C{fast_stop ∨ cancelled?}
+  C -- 是 --> X2[CancelSchedule → 返回<br/>Invoke 尾部 TryCloseCancelled]
+  C -- 否 --> D{held?}
+  D -- 是 --> X3[CancelSchedule<br/>Publish Release 后重新 MarkReady]
+  D -- 否 --> E{topology 为空?}
+  E -- 是 --> X
+  E -- 否 --> F{HasParked ∧ !RetryParked?}
+  F -- 是 --> X4[CancelSchedule<br/>消费者 Pop 后重试 parked]
+  F -- 否 --> G{OutputsBlocked?}
+  G -- 是 --> X5[CancelSchedule<br/>边标 backpressured, 消费者 Pop 时 ClearBackpressure → MarkReady]
+  G -- 否 --> H{is_source?}
+  H -- 是 --> S[RunSource]
+  H -- 否 --> I{is_async?}
+  I -- 是 --> RA[RunAsync]
+  I -- 否 --> RP[RunProcess]
+
+  S --> S1{paused ∧ !retiring?}
+  S1 -- 是 --> X
+  S1 -- 否 --> S2{stopping ∨ retiring?}
+  S2 -- 是 --> FN[TryEnterDraining → FinishNode]
+  S2 -- 否 --> S3[Process input_count=0]
+  S3 --> S4{结果}
+  S4 -- error ∧ cancelled --> X
+  S4 -- error --> FAIL[Fail → on_node_failed → OnNodeDone]
+  S4 -- kExhausted --> FN
+  S4 -- kContinue --> S5{held ∨ OutputsBlocked?}
+  S5 -- 否 --> MR[MarkReady 自驱]
+  S5 -- 是 --> X
+
+  RP --> P1[TryAcquire batch<br/>ClearBackpressure 上游 → RetryParked / RetryBlocked / MarkReady]
+  P1 --> P2{batch 为空?}
+  P2 -- 是, InputEnded --> FN
+  P2 -- 是, MayBeReady --> MR
+  P2 -- 否 --> P3[SwitchAtPacketBoundary<br/>Process]
+  P3 --> P4{结果}
+  P4 -- error --> FAIL
+  P4 -- ok, MayBeReady --> MR
+  P4 -- ok, InputEnded --> FN
+
+  RA --> A1{async_pending ≥ max?}
+  A1 -- 是 --> PA[ParkAsync until_zero=false]
+  A1 -- 否 --> A2[TryAcquire batch]
+  A2 -- 空, InputEnded, pending≠0 --> PA2[ParkAsync until_zero=true]
+  A2 -- 空, InputEnded, pending==0 --> FN
+  A2 -- 非空 --> A3[BeginAsync → async_.submit]
+  A3 --> MR
+
+  FN --> F1[Process FLUSH]
+  F1 --> F2[eos_retry_ += 输出端口]
+  F2 --> RB[RetryBlocked: 先 RetryParked 再 EmitEos]
+  RB -- 全部送达 --> CL[CloseNode → OnNodeDone]
+  RB -- WOULD_BLOCK --> W[留在 draining<br/>消费者 Pop / Tick 再试]

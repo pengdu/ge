@@ -1,0 +1,9 @@
+src/utilities/md5.h
+src/utilities/md5.cpp
+src/utilities/gpu_info.cpp
+src/utilities/gpu_info.h
+src/server/cli.cpp
+src/server/libcli.c
+src/server/libcli.h
+CMakeCXXCompilerId.cpp
+CMakeFiles/

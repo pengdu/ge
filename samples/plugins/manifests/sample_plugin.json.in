@@ -1,0 +1,21 @@
+{
+  "kind": "PluginManifest",
+  "schema_version": 1,
+  "$id": "ge.dev/schema/plugin/v1",
+  "plugin_id": "com.example.sample",
+  "abi": {
+    "major": 1,
+    "minor": 0
+  },
+  "library": "sample_plugin.so",
+  "build_fingerprint": "@GE_BUILD_FINGERPRINT@",
+  "dependencies": [],
+  "resources": [],
+  "operators": [
+    "Src@1.0.0",
+    "Pass@1.0.0",
+    "Sink@1.0.0",
+    "AsyncPass@1.0.0"
+  ],
+  "no_owned_threads": true
+}

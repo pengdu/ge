@@ -67,3 +67,7 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+.superpowers/
+CTestTestfile.cmake
+DartConfiguration.tcl
+.brooks-lint-history.json

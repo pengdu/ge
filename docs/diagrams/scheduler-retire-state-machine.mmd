@@ -1,0 +1,10 @@
+stateDiagram-v2
+  direction LR
+  [*] --> Published: Publish(next, RetireRequest)
+  Published --> Draining: policy=Drain<br/>removed 节点 MarkRetiring<br/>kept 生产者的 removed 边 MarkDraining + EOS 注入
+  Published --> FastApplied: policy=Fast → ApplyFastLocked<br/>removed 节点 MarkCancelled, 边 MarkRetired(fast)
+  Draining --> Completed: DrainComplete<br/>(removed 节点 closed/failed ∧ removed 边 空且 retired)
+  Draining --> FastApplied: now ≥ deadline ∧ !DrainComplete<br/>timed_out=true, on_drain_timeout
+  Draining --> FastApplied: Stop(fast)
+  FastApplied --> Completed: removed 节点全部 closed/failed
+  Completed --> [*]: on_complete(timed_out)

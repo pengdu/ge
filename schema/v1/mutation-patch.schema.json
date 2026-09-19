@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ge.dev/schema/patch/v1",
+  "title": "MutationPatch",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "actions"],
+  "properties": {
+    "kind": {"const": "MutationPatch"},
+    "schema_version": {"const": 1},
+    "$id": {"type": "string"},
+    "allow_unknown_fields": {"type": "boolean", "default": false},
+    "base_topology_version": {"type": "integer", "minimum": 1},
+    "remove_policy": {"enum": ["drain", "fast"], "default": "drain"},
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/action"}
+    }
+  },
+  "$defs": {
+    "nodeId": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$"},
+    "edgeId": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$"},
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "operator"],
+      "properties": {
+        "id": {"$ref": "#/$defs/nodeId"},
+        "operator": {"type": "string", "minLength": 1},
+        "options": {"type": "object"}
+      }
+    },
+    "action": {
+      "oneOf": [
+        {"$ref": "#/$defs/insertChain"},
+        {"$ref": "#/$defs/removeChain"},
+        {"$ref": "#/$defs/replaceNode"},
+        {"$ref": "#/$defs/removeBranch"},
+        {"$ref": "#/$defs/setNodeOptions"}
+      ]
+    },
+    "insertChain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "edge", "nodes"],
+      "properties": {
+        "type": {"const": "insert_chain"},
+        "edge": {"$ref": "#/$defs/edgeId"},
+        "nodes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/node"}},
+        "ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "chain_input": {"type": "string", "minLength": 1},
+            "chain_output": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "removeChain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "nodes", "mode"],
+      "properties": {
+        "type": {"const": "remove_chain"},
+        "nodes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nodeId"}},
+        "mode": {"enum": ["disconnect", "bypass"]},
+        "remove_policy": {"enum": ["drain", "fast"]}
+      }
+    },
+    "replaceNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "node", "replacement"],
+      "properties": {
+        "type": {"const": "replace_node"},
+        "node": {"$ref": "#/$defs/nodeId"},
+        "replacement": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operator"],
+          "properties": {
+            "operator": {"type": "string", "minLength": 1},
+            "options": {"type": "object"}
+          }
+        },
+        "port_mapping": {"type": "object"},
+        "remove_policy": {"enum": ["drain", "fast"]}
+      }
+    },
+    "removeBranch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "entry_edge", "nodes"],
+      "properties": {
+        "type": {"const": "remove_branch"},
+        "entry_edge": {"$ref": "#/$defs/edgeId"},
+        "nodes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nodeId"}},
+        "remove_policy": {"enum": ["drain", "fast"]}
+      }
+    },
+    "setNodeOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "node", "parameters"],
+      "properties": {
+        "type": {"const": "set_node_options"},
+        "node": {"$ref": "#/$defs/nodeId"},
+        "parameters": {"type": "object", "minProperties": 1}
+      }
+    }
+  }
+}

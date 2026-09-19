@@ -1,0 +1,12 @@
+# CI image for the Linux lanes (docs/11 TD-04). Dependencies come from
+# ci/setup-ubuntu.sh, the same script the GitHub runner uses.
+#
+#   docker build -f ci/Dockerfile.ci -t ge-ci .
+#   docker run --rm -v "$PWD:/src" -w /src ge-ci sh ci/build.sh release
+FROM ubuntu:24.04
+
+ARG ORT_VERSION=1.30.0
+COPY ci/setup-ubuntu.sh /tmp/setup-ubuntu.sh
+RUN sh /tmp/setup-ubuntu.sh && rm -rf /var/lib/apt/lists/* /tmp/setup-ubuntu.sh
+
+ENV PKG_CONFIG_PATH=/opt/onnxruntime/lib/pkgconfig

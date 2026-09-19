@@ -1,0 +1,28 @@
+stateDiagram-v2
+  direction LR
+  [*] --> created: NodeRuntime 构造
+  created --> opening: Open()
+  opening --> ready: Open ok
+  opening --> failed: Open error
+  ready --> running: BeginInvoke (RunSource / RunProcess / RunAsync)
+  running --> ready: EndInvoke
+  ready --> async_pending: EnterAsyncPending (在途达上限 / 等待归零)
+  async_pending --> ready: TryLeaveAsyncPending (completion 释放槽位)
+  ready --> draining: TryEnterDraining (输入结束 / kExhausted / stopping / retiring / cancelled)
+  running --> draining: TryEnterDraining (in_flight==0)
+  draining --> closing: EOS 全部送达 → CloseNode
+  draining --> failed: FLUSH Process 返回错误
+  closing --> closed: Close() 返回
+  ready --> failed: Process 返回错误 (非 cancelled)
+  running --> failed: Process 返回错误 (非 cancelled)
+  created --> closed: AbandonCandidate / TryCloseCancelled
+  closed --> [*]
+  failed --> [*]
+
+  note right of ready
+    正交标志 (与 state 无关, 原子 bool):
+    held      — Publish 期间 MUT-3 局部暂停
+    retiring  — Drain 删除: 源下一轮 flush+EOS
+    cancelled — Fast 删除 / Fast Stop: emit 被拒
+    busy      — 有 Invoke 任务在栈上
+  end note

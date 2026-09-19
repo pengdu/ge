@@ -1,0 +1,74 @@
+---
+Language:           Cpp
+BasedOnStyle:       Google
+AccessModifierOffset: -2
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+AlignTrailingComments: true
+AlignEscapedNewlines: DontAlign
+AlignOperands:      DontAlign
+AlwaysBreakAfterReturnType: None
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AlwaysBreakAfterDefinitionReturnType: false
+AlwaysBreakTemplateDeclarations: false
+AlwaysBreakBeforeMultilineStrings: false
+BreakBeforeBinaryOperators: All
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializersBeforeComma: false
+BinPackParameters:  true
+BinPackArguments:   true
+ColumnLimit:        200
+ConstructorInitializerAllOnOneLineOrOnePerLine: false
+ConstructorInitializerIndentWidth: 2
+DerivePointerAlignment: false
+IndentCaseLabels:   false
+IndentWrappedFunctionNames: false
+IndentFunctionDeclarationAfterType: false
+IndentPPDirectives: None
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: true
+NamespaceIndentation: Inner
+ObjCBlockIndentWidth: 4
+ObjCSpaceAfterProperty: true
+ObjCSpaceBeforeProtocolList: true
+PointerAlignment:   Left
+SpacesBeforeTrailingComments: 1
+SpaceBeforeParens:  ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceBeforeCpp11BracedList: true
+SpaceBeforeCtorInitializerColon: true
+SpacesInContainerLiterals: true
+Cpp11BracedListStyle: true
+Standard:           Cpp11
+IndentWidth:        2
+TabWidth:           2
+UseTab:             Never
+BreakBeforeBraces:  Custom
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpacesInAngles:     false
+SpaceInEmptyParentheses: false
+SpacesInCStyleCastParentheses: false
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+ContinuationIndentWidth: 2
+CommentPragmas:     '^ IWYU pragma:'
+ForEachMacros:      [ foreach, Q_FOREACH, BOOST_FOREACH ]
+DisableFormat:      false
+FixNamespaceComments: true
+BraceWrapping:
+  AfterEnum:        true
+  AfterStruct:      false
+  SplitEmptyFunction: false
+  AfterFunction:    false
+  AfterNamespace:   false
+  AfterUnion:       false
+  AfterExternBlock: false
+  BeforeCatch:      false
+  BeforeElse:       false
+...
