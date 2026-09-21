@@ -57,8 +57,16 @@ struct Fixture {
   std::map<std::string, TickingSource*> tickers;
   std::map<std::string, PassThrough*> passes;
   std::map<std::string, Collector*> sinks;
+  std::map<std::string, Gate*> gates;
 
   Fixture() {
+    factory.Register(Desc("Gate@1.0.0", {BytesPort("in", ge::PortDirection::kInput)},
+                          {BytesPort("out", ge::PortDirection::kOutput, true, ge::PortCardinality::kMulti)}, false, 1),
+                     [this](const ge::OperatorCreateArgs& a) {
+                       auto g = std::make_shared<Gate>();
+                       gates[a.external_id] = g.get();
+                       return Keep(keep, g);
+                     });
     factory.Register(Desc("Src@1.0.0", {}, {BytesPort("out", ge::PortDirection::kOutput, true, ge::PortCardinality::kMulti)}, true, 1),
                      [this](const ge::OperatorCreateArgs& a) {
                        const auto n = a.options.GetInteger("count").value_or(10);
@@ -679,8 +687,11 @@ TEST(SessionTest, DrainTimeoutUpgradesToFast) {
   ge::GraphBuilder g("slow");
   auto src = g.AddNode(Op("Tick@1.0.0"), "src", ge::JsonValue(ge::JsonObject{{"period_us", ge::JsonValue(10)}}));
   auto a = g.AddNode(Op("Pass@1.0.0"), "a");
-  // Slow branch: each packet takes 2ms; queue of 64 needs >100ms to drain.
-  auto slow = g.AddNode(Op("Pass@1.0.0"), "slow", ge::JsonValue(ge::JsonObject{{"delay_us", ge::JsonValue(2000)}}));
+  // Stuck branch: the gate never opens on its own, so the drain cannot
+  // complete and the deadline must fire. (A "slow" node with a per-packet
+  // sleep was a timing guess: under a starved executor it drained within
+  // the 30ms just often enough to flake.)
+  auto slow = g.AddNode(Op("Gate@1.0.0"), "slow");
   auto s1 = g.AddNode(Op("Sink@1.0.0"), "sink1");
   auto s2 = g.AddNode(Op("Sink@1.0.0"), "sink2");
   g.Connect(src.port("out"), a.port("in"));
@@ -691,12 +702,25 @@ TEST(SessionTest, DrainTimeoutUpgradesToFast) {
   auto s = f.Create(*g.Build(), exec, {.drain_timeout = std::chrono::milliseconds(30)},
                     {.on_drain_timeout = [&](ge::TopologyVersion) { ++timeouts; }});
   ASSERT_TRUE(s->Start().ok());
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  Gate* gate = f.gates.at("slow");
+  for (int i = 0; i < 2000 && gate->entered.load() == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(gate->entered.load(), 0);  // the branch is live and stuck in Process
   auto op = s->Apply(ge::Mutation().RemoveBranch("to_slow", {.nodes = {"slow", "sink2"}}).Build());
   ASSERT_TRUE(op.ok());
-  // Watchdog role: tick until the operation finishes.
+  // Watchdog role: tick until the deadline upgrades the retire to fast.
+  // The engine never interrupts a running Process call (12 §7.7): the
+  // cancelled node closes when its call returns, so open the gate only
+  // after the timeout fired and keep ticking until the operation ends.
+  for (int i = 0; i < 5000 && timeouts.load() == 0; ++i) {
+    s->Tick();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  ASSERT_EQ(timeouts.load(), 1);
+  gate->Release();
   ge::OperationRecord rec;
-  for (int i = 0; i < 500; ++i) {
+  for (int i = 0; i < 5000; ++i) {
     s->Tick();
     if (auto r = f.ops.Get(*op); r && r->terminal()) {
       rec = *r;
@@ -713,6 +737,8 @@ TEST(SessionTest, DrainTimeoutUpgradesToFast) {
   EXPECT_EQ(diff.at("edges").as_object().at("to_slow").GetString("change"), "removed");
   EXPECT_TRUE(rec.detail.as_object().contains("prepare_ms"));
   EXPECT_TRUE(rec.detail.as_object().contains("retire_ms"));
+  EXPECT_TRUE(gate->closed);
+  EXPECT_TRUE(gate->fast_close);
   EXPECT_TRUE(f.sinks["sink2"]->closed);
   auto stop = s->Stop(true);
   ASSERT_TRUE(stop.ok());

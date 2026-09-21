@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -219,6 +220,51 @@ class Collector final : public Operator {
   std::vector<PacketSeq> seqs;
   std::vector<std::string> ports;
   std::vector<Packet> packets;
+};
+
+// Forwards its input but blocks inside Process until Release() is called.
+// Deterministic replacement for "slow operator + short drain timeout"
+// tests: a sleep-based slow node is a timing guess that fails when the
+// stress runner starves the executor. The engine never interrupts a
+// running Process call, so the test must Release() before expecting the
+// node to close.
+class Gate final : public Operator {
+ public:
+  Status Open(const OpenRequest&) override { return Status::Ok(); }
+  Result<ProcessResult> Process(const ProcessRequest& req) override {
+    if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
+    {
+      std::unique_lock lock(mutex_);
+      ++entered;
+      cv_.wait(lock, [this] { return open_; });
+    }
+    for (const PacketRef& in : req.inputs) {
+      if (in->is_event()) continue;
+      Packet out = *in;
+      Status s = req.sink->Emit("out", std::move(out));
+      if (!s.ok() && s.code() != GE_STATUS_WOULD_BLOCK) return s;
+    }
+    return ProcessResult::kContinue;
+  }
+  Status Close(const CloseRequest& r) override {
+    closed = true;
+    fast_close = r.fast_shutdown;
+    return Status::Ok();
+  }
+  void Release() {
+    {
+      std::lock_guard lock(mutex_);
+      open_ = true;
+    }
+    cv_.notify_all();
+  }
+  std::atomic<int> entered{0};
+  std::atomic<bool> closed{false}, fast_close{false};
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool open_ = false;
 };
 
 // Fails on the N-th packet.

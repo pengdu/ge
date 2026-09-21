@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -58,6 +59,17 @@ bool HaveModel() {
 
 #define SKIP_WITHOUT_MODEL()                                                                     \
   if (!HaveModel()) GTEST_SKIP() << "ONNX Runtime or model not available (" << ModelPath() << ")"
+
+// Batch window for the "actually batches" tests. The assertion is that the
+// batcher merged at least two requests, which needs a second request to be
+// submitted before the first one's window expires. On an idle machine 20ms
+// is plenty; under the contention stress runner (8 TSan copies per core)
+// the source thread can be descheduled for longer than that, so the window
+// is widened there. The test still checks the batching logic, only the
+// scheduler's ability to deliver two packets inside the window changes.
+std::chrono::milliseconds BatchTimeout() {
+  return std::chrono::milliseconds(std::getenv("GE_STRESS") != nullptr ? 500 : 20);
+}
 
 // Emits |count| Tensor packets on "out".
 class TensorSource final : public ge::Operator {
@@ -281,7 +293,7 @@ TEST(OnnxInferTest, BatchedMatchesReferenceAndActuallyBatches) {
   ge::AsyncOptions ao;
   ao.batching = true;
   ao.max_batch = 4;
-  ao.batch_timeout = std::chrono::milliseconds(20);
+  ao.batch_timeout = BatchTimeout();
   Fixture f(ao);
   ge::ExecutorPool exec(2);
   // A small simulated delay keeps requests queued long enough to form
@@ -310,7 +322,7 @@ TEST(OnnxInferTest, TwoSessionsShareTheBatcher) {
   SKIP_WITHOUT_MODEL();
   ge::AsyncOptions ao;
   ao.max_batch = 8;
-  ao.batch_timeout = std::chrono::milliseconds(20);
+  ao.batch_timeout = BatchTimeout();
   Fixture f(ao);
   ge::ExecutorPool exec(4);
   auto s1 = f.Create(f.Graph(6, {{"simulate_delay_ms", ge::JsonValue(5)}}, "a"), exec, {.id = 1});

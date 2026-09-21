@@ -68,19 +68,24 @@ Status Scheduler::Publish(std::shared_ptr<RuntimeTopology> next, RetireRequest r
   for (const NodeRuntimeRef& n : held) WaitQuiescent(*n);
 
   // B1: swap. New nodes route through Vn+1 from their first invocation;
-  // kept nodes switch now; removed nodes keep Vn (12 §7.7).
-  next->ApplyRebinds();
-  for (const NodeRuntimeRef& n : next->nodes()) n->SetTopology(next);
-  topology_.store(next);
-  AttachNodes(next->new_nodes());
-  // Stop() raced with the swap: the new nodes are attached now, so the
-  // stop's EOS/cancel sweep may have missed them. Re-run the sweep on the
-  // new topology; both are idempotent.
-  if (stopping_.load(std::memory_order_acquire)) {
-    if (fast_stop_.load(std::memory_order_acquire)) {
-      for (const NodeRuntimeRef& n : next->new_nodes()) n->MarkCancelled();
-      for (const EdgeChannelRef& e : next->edges()) e->MarkRetired(true);
+  // kept nodes switch now; removed nodes keep Vn (12 §7.7). Under
+  // swap_mutex_ so a concurrent Stop() either sees the new nodes in its
+  // LiveNodes() snapshot or we see stopping_ and refuse (the coordinator
+  // abandons |next|); the window in between is what used to leave a fresh
+  // branch attached with nothing ever closing it.
+  {
+    std::lock_guard swap(swap_mutex_);
+    if (stopping_.load(std::memory_order_acquire)) {
+      for (const NodeRuntimeRef& n : held) {
+        n->Release();
+        MarkReady(*n);  // an invoke skipped while held would otherwise be lost
+      }
+      return Status::Cancelled("session stopping: topology not published");
     }
+    next->ApplyRebinds();
+    for (const NodeRuntimeRef& n : next->nodes()) n->SetTopology(next);
+    topology_.store(next);
+    AttachNodes(next->new_nodes());
   }
 
   // B3: removed edges of kept producers get an EOS marker right away (their
@@ -113,17 +118,10 @@ Status Scheduler::Publish(std::shared_ptr<RuntimeTopology> next, RetireRequest r
   }
   RetryInjections();
 
-  // Release held producers and kick everything that may have work.
+  // Release held producers and kick everything that may have work. A Stop()
+  // that lands from here on finds the new nodes in LiveNodes() and sweeps
+  // them like any other.
   for (const NodeRuntimeRef& n : held) n->Release();
-  if (stopping_.load(std::memory_order_acquire)) {
-    if (fast_stop_.load(std::memory_order_acquire)) {
-      for (const NodeRuntimeRef& n : next->new_nodes()) TryCloseCancelled(*n);
-    } else {
-      for (const NodeRuntimeRef& n : next->nodes()) {
-        if (n->is_source()) MarkReady(*n);
-      }
-    }
-  }
   if (started_.load(std::memory_order_acquire)) {
     for (const NodeRuntimeRef& n : next->nodes()) {
       if (n->is_source()) {

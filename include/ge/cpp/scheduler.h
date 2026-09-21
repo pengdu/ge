@@ -219,6 +219,11 @@ class Scheduler final {
   std::atomic<bool> stopping_{false};
   std::atomic<bool> fast_stop_{false};
   std::atomic<bool> all_closed_{false};
+  // Serialises the Publish swap (stopping_ check -> AttachNodes) against
+  // Stop (LiveNodes snapshot -> stopping_ = true): a swap that lands after
+  // Stop snapshotted the live set would attach nodes no EOS/cancel sweep
+  // reaches (docs/16 §5).
+  std::mutex swap_mutex_;
   // Attached nodes not yet closed/failed; every attached NodeRuntime is
   // kept alive here until done so executor tasks never dangle.
   std::atomic<std::uint32_t> live_count_{0};

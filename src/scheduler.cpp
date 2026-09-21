@@ -137,9 +137,24 @@ void Scheduler::Resume() {
 }
 
 void Scheduler::Stop(bool fast) {
-  const std::vector<NodeRuntimeRef> live = LiveNodes();
-  if (!fast) {
+  // Snapshot and announce under swap_mutex_: a Publish that lost the lock
+  // sees stopping_ and refuses; one that won has its nodes in |live|.
+  std::vector<NodeRuntimeRef> live;
+  {
+    std::lock_guard swap(swap_mutex_);
+    if (fast) {
+      // Cancel before announcing the stop: a source observing stopping_
+      // first would take the drain path (EOS + graceful Close) instead of
+      // the fast one.
+      fast_stop_.store(true, std::memory_order_release);
+      live = LiveNodes();
+      for (const NodeRuntimeRef& n : live) n->MarkCancelled();
+    } else {
+      live = LiveNodes();
+    }
     stopping_.store(true, std::memory_order_release);
+  }
+  if (!fast) {
     paused_.store(false, std::memory_order_release);
     for (const NodeRuntimeRef& n : live) {
       if (n->is_source()) MarkReady(*n);
@@ -147,11 +162,6 @@ void Scheduler::Stop(bool fast) {
     Tick();
     return;
   }
-  // Cancel before announcing the stop: a source observing stopping_ first
-  // would take the drain path (EOS + graceful Close) instead of the fast one.
-  fast_stop_.store(true, std::memory_order_release);
-  for (const NodeRuntimeRef& n : live) n->MarkCancelled();
-  stopping_.store(true, std::memory_order_release);
   {
     std::lock_guard lock(retire_mutex_);
     for (Retired& r : retired_) {

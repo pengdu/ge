@@ -168,7 +168,9 @@ function (ge_add_stress_test target)
   math (EXPR stress_total "${GE_STRESS_TIMEOUT} * ${GE_STRESS_ROUNDS} + 60")
   set_tests_properties (${name} PROPERTIES LABELS stress TIMEOUT ${stress_total} RUN_SERIAL TRUE)
 endfunction ()
-ge_add_stress_test (ge_scheduler_test)
+# The 10-node/20k-packet latency probe runs inline (no executor threads), so contention teaches it nothing; under TSan
+# it costs ~15s per repeat and pushed the copies past the watchdog.
+ge_add_stress_test (ge_scheduler_test "-*TenNodeLatency*")
 ge_add_stress_test (ge_mutation_stress_test)
 ge_add_stress_test (ge_async_runtime_test)
 ge_add_stress_test (ge_session_test)

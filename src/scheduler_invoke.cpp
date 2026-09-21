@@ -126,6 +126,11 @@ std::optional<ProcessResult> Scheduler::RunProcessCall(NodeRuntime& node, Proces
       static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
       std::memory_order_relaxed);
+  // The batch is consumed: release the payloads *before* EndInvoke returns
+  // the slot. Once the slot is free another executor thread may drain and
+  // close this node, the sink, and signal all-closed while this frame still
+  // sits here; a leak check right after Stop would then see our reference.
+  req.inputs.clear();
   if (!r.ok() && node.cancelled()) {
     node.EndInvoke();
     return std::nullopt;
@@ -133,7 +138,6 @@ std::optional<ProcessResult> Scheduler::RunProcessCall(NodeRuntime& node, Proces
   if (!r.ok()) node.Fail(r.status());
   node.EndInvoke();
   if (!r.ok()) {
-    req.inputs.clear();  // release before OnNodeDone may signal all-closed
     if (events_.on_node_failed) events_.on_node_failed(node, r.status());
     OnNodeDone(node);
     return std::nullopt;
@@ -204,9 +208,6 @@ void Scheduler::RunProcess(NodeRuntime& node, const RuntimeTopology& topo, Input
   MoveBatchInto(*batch, req.input_ports, req.inputs);
   node.metrics().packets_in.fetch_add(req.inputs.size(), std::memory_order_relaxed);
   if (!RunProcessCall(node, req, sink)) return;
-  // The batch is consumed: release the payloads before anything that may
-  // signal "all closed" (a leak check right after Stop would see them).
-  req.inputs.clear();
   if (node.held()) return;  // Publish re-marks after Release()
   if (binding.MayBeReady()) {
     MarkReady(node);
