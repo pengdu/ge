@@ -325,8 +325,10 @@ TEST(GraphValidatorTest, HundredNodesThreeHundredEdgesUnder50ms) {
   ASSERT_TRUE(r.ok()) << r.status().ToString();
   EXPECT_EQ(r->topological_order.size(), 100U);
   // The 50ms budget (15 P1) is measured by ge_bench_validate on optimised
-  // builds; here the check only guards against algorithmic blow-ups.
-  EXPECT_LT(ms, GE_TEST_SANITIZED ? 500 : 50);
+  // builds; here the check only guards against algorithmic blow-ups. ASan
+  // on a shared CI runner has been seen at 566ms, so the sanitized bound is
+  // deliberately loose.
+  EXPECT_LT(ms, GE_TEST_SANITIZED ? 2000 : 50);
 }
 
 }  // namespace
