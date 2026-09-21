@@ -63,7 +63,11 @@ class VideoScale final : public Operator {
         // Any frames still inside the old graph are pushed out first so
         // nothing is lost across a rebuild.
         if (graph_) {
-          (void)av_buffersrc_add_frame_flags(src_, nullptr, 0);
+          // GCC ignores (void) on av_warn_unused_result; an EOS push that
+          // fails is a real error anyway.
+          if (const int err = av_buffersrc_add_frame_flags(src_, nullptr, 0); err < 0) {
+            return ff::ToStatus(err, ctx_.Prefix() + "flush old graph");
+          }
           if (Result<ProcessResult> r = Drain(req); !r.ok()) return r;
         }
         watermark_ = wm;
