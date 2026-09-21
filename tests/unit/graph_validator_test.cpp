@@ -2,8 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <map>
+#include <string>
 
 #ifndef __has_feature
 #define __has_feature(x) 0
@@ -296,39 +300,62 @@ TEST(GraphValidatorTest, SharedDependenciesAndLinearChain) {
   EXPECT_EQ(ge::GraphValidator::CheckLinearChain(spec, {}).status().code(), GE_STATUS_GRAPH_INVALID);
 }
 
+// Builds src -> mix0 -> ... -> mix{n-1} with up to three extra "b" inputs per
+// mix from its predecessors, until |edges| edges exist.
+ge::GraphSpec ChainWithFanIn(int nodes, int edges) {
+  ge::GraphSpec spec("big" + std::to_string(nodes));
+  EXPECT_TRUE(spec.AddNode({.id = "src", .op = Op("Src@1.0.0")}).ok());
+  for (int i = 0; i < nodes - 1; ++i) {
+    EXPECT_TRUE(spec.AddNode({.id = "mix" + std::to_string(i), .op = Op("Mix@1.0.0")}).ok());
+  }
+  int count = 0;
+  for (int i = 0; i < nodes - 1; ++i) {
+    const std::string from = i == 0 ? "src" : "mix" + std::to_string(i - 1);
+    EXPECT_TRUE(spec.AddEdge({.from = {from, "out"}, .to = {"mix" + std::to_string(i), "a"}}).ok());
+    ++count;
+  }
+  for (int i = 1; i < nodes - 1 && count < edges; ++i) {
+    const std::string to = "mix" + std::to_string(i);
+    for (int j = i - 1; j >= 0 && count < edges && j > i - 4; --j) {
+      EXPECT_TRUE(spec.AddEdge({.from = {"mix" + std::to_string(j), "out"}, .to = {to, "b"}}).ok());
+      ++count;
+    }
+  }
+  EXPECT_EQ(count, edges);
+  return spec;
+}
+
+// Best-of-N wall time of one Validate() in microseconds.
+std::int64_t ValidateUs(ge::GraphValidator& v, const ge::GraphSpec& spec, int samples) {
+  std::int64_t best = std::numeric_limits<std::int64_t>::max();
+  for (int i = 0; i < samples; ++i) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto r = v.Validate(spec);
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+    EXPECT_TRUE(r.ok()) << r.status().ToString();
+    best = std::min<std::int64_t>(best, us);
+  }
+  return best;
+}
+
 TEST(GraphValidatorTest, HundredNodesThreeHundredEdgesUnder50ms) {
   Registry reg;
   ge::GraphValidator v(reg.resolver());
-  ge::GraphSpec spec("big");
-  ASSERT_TRUE(spec.AddNode({.id = "src", .op = Op("Src@1.0.0")}).ok());
-  for (int i = 0; i < 99; ++i) {
-    ASSERT_TRUE(spec.AddNode({.id = "mix" + std::to_string(i), .op = Op("Mix@1.0.0")}).ok());
-  }
-  int edges = 0;
-  for (int i = 0; i < 99; ++i) {
-    const std::string from = i == 0 ? "src" : "mix" + std::to_string(i - 1);
-    ASSERT_TRUE(spec.AddEdge({.from = {from, "out"}, .to = {"mix" + std::to_string(i), "a"}}).ok());
-    ++edges;
-  }
-  for (int i = 1; i < 99 && edges < 300; ++i) {
-    const std::string to = "mix" + std::to_string(i);
-    for (int j = i - 1; j >= 0 && edges < 300 && j > i - 4; --j) {
-      ASSERT_TRUE(spec.AddEdge({.from = {"mix" + std::to_string(j), "out"}, .to = {to, "b"}}).ok());
-      ++edges;
-    }
-  }
-  ASSERT_EQ(edges, 300);
-  const auto start = std::chrono::steady_clock::now();
+  const ge::GraphSpec spec = ChainWithFanIn(100, 300);
   const auto r = v.Validate(spec);
-  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - start).count();
   ASSERT_TRUE(r.ok()) << r.status().ToString();
   EXPECT_EQ(r->topological_order.size(), 100U);
-  // The 50ms budget (15 P1) is measured by ge_bench_validate on optimised
-  // builds; here the check only guards against algorithmic blow-ups. ASan
-  // on a shared CI runner has been seen at 566ms, so the sanitized bound is
-  // deliberately loose.
-  EXPECT_LT(ms, GE_TEST_SANITIZED ? 2000 : 50);
+  // Algorithmic guard, independent of machine speed and sanitizer overhead:
+  // 10x the graph (nodes and edges) may cost at most 40x the time of the
+  // small one (O(n log n) with headroom; O(n^2) would be 100x). Both sides
+  // are best-of-5 so a scheduler hiccup on a loaded runner does not skew
+  // the ratio. The absolute 50ms budget (15 P1) is measured by ge_bench on
+  // optimised builds and only enforced there.
+  const std::int64_t small_us = std::max<std::int64_t>(1, ValidateUs(v, ChainWithFanIn(10, 30), 5));
+  const std::int64_t big_us = ValidateUs(v, spec, 5);
+  EXPECT_LT(big_us, small_us * 40) << "10 nodes/30 edges: " << small_us << "us, 100/300: " << big_us << "us";
+  if (!GE_TEST_SANITIZED) EXPECT_LT(big_us, 50'000);
 }
 
 }  // namespace
