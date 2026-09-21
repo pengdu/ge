@@ -39,6 +39,12 @@ add_library (ge_test_flags INTERFACE)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options (ge_test_flags INTERFACE -Wno-conversion -Wno-sign-conversion -Wno-shadow
                                                   -Wno-missing-field-initializers)
+  if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC -O3 inlines std::variant's destructor visitor for every alternative and then cannot prove which one is
+    # live (Result<int> in types_test), reporting the inactive std::string as maybe-uninitialized. Known libstdc++
+    # false positive (PR 80635 family); src/ compiles clean, so it is silenced for tests only.
+    target_compile_options (ge_test_flags INTERFACE -Wno-maybe-uninitialized)
+  endif ()
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # Clang 21+ only; an unknown -Wno- flag is itself an error under -Werror on older clang.
     include (CheckCXXCompilerFlag)

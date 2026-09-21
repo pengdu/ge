@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <numeric>
 #include <string>
 
@@ -116,11 +117,12 @@ ge::OperatorKey Op(const char* t) { return *ge::OperatorKey::Parse(t); }
 
 
 ge::GraphSpec Linear(int nodes, std::int64_t count, ge::DropPolicy policy = ge::DropPolicy::kBlock,
-                     std::uint32_t capacity = 64) {
+                     std::uint32_t capacity = 64, std::int64_t pass_delay_us = 0) {
   ge::GraphBuilder b("linear");
   auto prev = b.AddNode(Op("Src@1.0.0"), "src", ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(count)}}));
   for (int i = 0; i < nodes; ++i) {
-    auto p = b.AddNode(Op("Pass@1.0.0"), "p" + std::to_string(i));
+    auto p = b.AddNode(Op("Pass@1.0.0"), "p" + std::to_string(i),
+                       ge::JsonValue(ge::JsonObject{{"delay_us", ge::JsonValue(pass_delay_us)}}));
     ge::EdgeOptions eo;
     eo.queue.policy = policy;
     eo.queue.capacity = capacity;
@@ -274,7 +276,10 @@ TEST(SchedulerTest, SyncEmitOverrunIsParkedNotDroppedAndStaysOrdered) {
 
 TEST(SchedulerTest, BlockPolicyBackpressuresSourceWithoutLoss) {
   Fixture f;
-  auto topo = f.Build(Linear(1, 500, ge::DropPolicy::kBlock, 2));
+  // A slow consumer guarantees the source hits a full edge at least once;
+  // without the delay a fast machine can drain capacity 2 as quickly as the
+  // source fills it and would_block stays 0 (seen on the Linux clang lane).
+  auto topo = f.Build(Linear(1, 500, ge::DropPolicy::kBlock, 2, 50));
   ASSERT_TRUE(topo);
   ge::ExecutorPool exec(2);
   ge::Scheduler s(topo, exec);
@@ -436,12 +441,19 @@ TEST(SchedulerTest, NodeFailureIsReported) {
   b.Connect(bad.port("out"), sink.port("in"));
   auto topo = f.Build(*b.Build());
   ge::ExecutorPool exec(2);
+  std::mutex m;
   std::string failed_node;
-  ge::Scheduler s(topo, exec, {.on_node_failed = [&](ge::NodeRuntime& n, const ge::Status&) { failed_node = n.external_id(); }});
+  ge::Scheduler s(topo, exec, {.on_node_failed = [&](ge::NodeRuntime& n, const ge::Status&) {
+                    std::lock_guard lock(m);
+                    failed_node = n.external_id();
+                  }});
   ASSERT_TRUE(s.OpenAll().ok());
   s.Start();
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  EXPECT_EQ(failed_node, "bad");
+  {
+    std::lock_guard lock(m);
+    EXPECT_EQ(failed_node, "bad");
+  }
   EXPECT_EQ(topo->FindNode("bad")->state(), ge::NodeState::kFailed);
   EXPECT_EQ(topo->FindNode("bad")->failure().code(), GE_STATUS_INTERNAL);
   EXPECT_EQ(f.sinks[0]->Seqs().size(), 2U);
