@@ -32,10 +32,13 @@ add_library (GTest::gtest_main UNKNOWN IMPORTED)
 set_target_properties (GTest::gtest_main PROPERTIES IMPORTED_LOCATION "${GTEST_MAIN_LIBRARY}"
                                                     INTERFACE_INCLUDE_DIRECTORIES "${GTEST_INCLUDE_DIR}")
 
-# gtest headers trip a few of our strict warnings; silence them for tests only.
+# gtest headers trip a few of our strict warnings; silence them for tests only. Tests also lean on designated
+# initialisers that omit members without a default member initialiser ({.id = "e0"} for EdgeOptions), which GCC and
+# clang <= 18 flag under -Wextra (Apple clang 21 does not).
 add_library (ge_test_flags INTERFACE)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  target_compile_options (ge_test_flags INTERFACE -Wno-conversion -Wno-sign-conversion -Wno-shadow)
+  target_compile_options (ge_test_flags INTERFACE -Wno-conversion -Wno-sign-conversion -Wno-shadow
+                                                  -Wno-missing-field-initializers)
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # Clang 21+ only; an unknown -Wno- flag is itself an error under -Werror on older clang.
     include (CheckCXXCompilerFlag)
@@ -43,10 +46,6 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     if (GE_HAS_WCHARACTER_CONVERSION)
       target_compile_options (ge_test_flags INTERFACE -Wno-character-conversion)
     endif ()
-  elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # GCC flags designated initialisers that omit members without a default member initialiser
-    # ({.id = "e0"} for EdgeOptions); clang does not. Tests rely on that idiom.
-    target_compile_options (ge_test_flags INTERFACE -Wno-missing-field-initializers)
   endif ()
 endif ()
 

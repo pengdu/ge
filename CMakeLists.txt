@@ -58,7 +58,7 @@ set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${GE_OUTPUT_ROOT}/bin")
 add_library (ge_build_flags INTERFACE)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options (ge_build_flags INTERFACE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion
-                                                   -Wsign-conversion -Wnon-virtual-dtor)
+                                                   -Wsign-conversion $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>)
   if (GE_ENABLE_SANITIZERS)
     target_compile_options (ge_build_flags INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options (ge_build_flags INTERFACE -fsanitize=address,undefined)
