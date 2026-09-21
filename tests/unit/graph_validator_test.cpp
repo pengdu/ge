@@ -355,7 +355,9 @@ TEST(GraphValidatorTest, HundredNodesThreeHundredEdgesUnder50ms) {
   const std::int64_t small_us = std::max<std::int64_t>(1, ValidateUs(v, ChainWithFanIn(10, 30), 5));
   const std::int64_t big_us = ValidateUs(v, spec, 5);
   EXPECT_LT(big_us, small_us * 40) << "10 nodes/30 edges: " << small_us << "us, 100/300: " << big_us << "us";
-  if (!GE_TEST_SANITIZED) EXPECT_LT(big_us, 50'000);
+  if (!GE_TEST_SANITIZED) {
+    EXPECT_LT(big_us, 50'000);
+  }
 }
 
 }  // namespace
