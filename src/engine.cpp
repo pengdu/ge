@@ -238,12 +238,12 @@ void Engine::WatchdogLoop() {
 }
 
 void Engine::Tick() {
-  std::vector<Session*> sessions;
+  std::vector<std::shared_ptr<Session>> sessions;
   {
     std::lock_guard lock(sessions_mutex_);
-    for (auto& [id, s] : sessions_) sessions.push_back(s.get());
+    for (auto& [id, s] : sessions_) sessions.push_back(s);
   }
-  for (Session* s : sessions) s->Tick();
+  for (const auto& s : sessions) s->Tick();
   if (!async_->options().worker_thread) (void)async_->Pump();
   if (config_.cpu_threads == 0) (void)executor_->RunPending();
   CompletePendingUnloads();
@@ -505,7 +505,7 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
     return r.status();
   }
   Session* raw = r->get();
-  sessions_[sid] = std::move(*r);
+  sessions_[sid] = std::shared_ptr<Session>(std::move(*r));
   operations_.Succeed(op, raw->topology_version());
   return raw;
 }
@@ -517,7 +517,7 @@ Session* Engine::FindSession(SessionId id) const {
 }
 
 Status Engine::DestroySession(SessionId id) {
-  std::unique_ptr<Session> s;
+  std::shared_ptr<Session> s;
   {
     std::lock_guard lock(sessions_mutex_);
     const auto it = sessions_.find(id);
@@ -544,17 +544,17 @@ Status Engine::DestroySession(SessionId id) {
 }
 
 void Engine::StopAll(bool fast) {
-  std::vector<Session*> sessions;
+  std::vector<std::shared_ptr<Session>> sessions;
   {
     std::lock_guard lock(sessions_mutex_);
-    for (auto& [id, s] : sessions_) sessions.push_back(s.get());
+    for (auto& [id, s] : sessions_) sessions.push_back(s);
   }
-  for (Session* s : sessions) {
+  for (const auto& s : sessions) {
     const SessionState st = s->state();
     if (st == SessionState::kStopped || st == SessionState::kCreated) continue;
     (void)s->Stop(fast);
   }
-  for (Session* s : sessions) {
+  for (const auto& s : sessions) {
     if (config_.cpu_threads == 0) {
       for (int i = 0; i < 100000 && !s->WaitStopped(std::chrono::milliseconds(0)); ++i) {
         (void)s->PumpMutations();

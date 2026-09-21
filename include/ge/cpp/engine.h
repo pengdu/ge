@@ -139,8 +139,11 @@ class Engine final {
   std::unique_ptr<ExecutorPool> executor_;
   std::unique_ptr<AsyncRuntime> async_;
   OperationRegistry operations_;
+  // shared_ptr, not unique_ptr: Tick()/StopAll() snapshot the sessions and
+  // call into them outside sessions_mutex_, so a concurrent DestroySession
+  // must not free a session the watchdog is still ticking (TSan, Linux CI).
   mutable std::mutex sessions_mutex_;
-  std::map<SessionId, std::unique_ptr<Session>> sessions_;
+  std::map<SessionId, std::shared_ptr<Session>> sessions_;
   SessionId next_session_id_ = 1;
   std::mutex retire_mutex_;
   std::vector<PendingRetire> pending_retires_;
