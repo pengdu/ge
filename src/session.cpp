@@ -242,6 +242,33 @@ void MutationCoordinator::FailAll(const Merged& batch, const Status& status,
   }
 }
 
+namespace {
+
+// 12 §10.2 estimate of a (sub)graph; |only_nodes|/|only_edges| empty means
+// the whole spec. Unbudgeted edges are rejected only when the session asks
+// for it (SessionOptions::reject_unbudgeted_edges).
+Result<std::vector<ResourceAmount>> EstimateForAdmission(
+    const GraphSpec& spec, const std::map<std::string, ConnectionContract>& contracts,
+    const OperatorFactory& factory, bool reject_unbudgeted, const std::vector<std::string>& only_nodes = {},
+    const std::vector<std::string>& only_edges = {}) {
+  const auto est = EstimateGraphResources(
+      spec, contracts,
+      [&factory](const OperatorKey& k, const JsonValue& options) { return factory.Estimate(k, options); },
+      only_nodes, only_edges);
+  if (reject_unbudgeted && !est.unbudgeted_edges.empty()) {
+    JsonArray edges;
+    for (const std::string& e : est.unbudgeted_edges) edges.push_back(JsonValue(e));
+    JsonObject ctx;
+    ctx.emplace("unbudgeted_edges", JsonValue(std::move(edges)));
+    return Status::GraphInvalid("edge '" + est.unbudgeted_edges.front() +
+                                    "' has no derivable packet bound; set queue.max_packet_bytes (12 §10.3)",
+                                JsonValue(std::move(ctx)).Serialize());
+  }
+  return est.amounts;
+}
+
+}  // namespace
+
 Result<MutationCoordinator::Prepared> MutationCoordinator::Prepare(const RuntimeTopology& base,
                                                                    const MutationPatch& patch,
                                                                    TopologyVersion version) {
@@ -250,8 +277,8 @@ Result<MutationCoordinator::Prepared> MutationCoordinator::Prepare(const Runtime
   if (!changes.ok()) return changes.status();
   // A5': validate + negotiate once, diff against the running version, and
   // let the diff alone decide what is carried over (kept/updated nodes, kept
-  // edges) versus re-created. A4–A5 (+ A8; A6 resources arrive with P8) --
-  // Build creates operator instances without opening them.
+  // edges) versus re-created. A4–A5 (+ A8) -- Build creates operator
+  // instances without opening them; A6 reserves the additions before A7.
   GraphValidator validator([this](const OperatorKey& k) { return factory_.Describe(k); });
   auto validated = validator.Validate(changes->candidate);
   if (!validated.ok()) return validated.status();
@@ -267,12 +294,43 @@ Result<MutationCoordinator::Prepared> MutationCoordinator::Prepare(const Runtime
   bo.validated = &*validated;
   auto built = RuntimeTopology::Build(changes->candidate, factory_, bo);
   if (!built.ok()) return built.status();
-  // A7 warm-up.
-  if (Status s = session_.scheduler().OpenNodes(**built); !s.ok()) {
+  // A6 admission (12 §10.2): what this version adds is reserved now, what it
+  // removes is returned when the retire completes. Replaced / recreated
+  // entries count on both sides (new instance up, old instance back).
+  const bool reject_unbudgeted = session_.options().reject_unbudgeted_edges;
+  std::vector<std::string> add_nodes = diff.Nodes(GraphDiff::NodeChange::kAdded);
+  for (const std::string& n : diff.Nodes(GraphDiff::NodeChange::kReplaced)) add_nodes.push_back(n);
+  std::vector<std::string> add_edges = diff.Edges(GraphDiff::EdgeChange::kAdded);
+  for (const std::string& e : diff.Edges(GraphDiff::EdgeChange::kRecreated)) add_edges.push_back(e);
+  std::vector<std::string> rm_nodes = diff.Nodes(GraphDiff::NodeChange::kRemoved);
+  for (const std::string& n : diff.Nodes(GraphDiff::NodeChange::kReplaced)) rm_nodes.push_back(n);
+  std::vector<std::string> rm_edges = diff.Edges(GraphDiff::EdgeChange::kRemoved);
+  for (const std::string& e : diff.Edges(GraphDiff::EdgeChange::kRecreated)) rm_edges.push_back(e);
+  Prepared p;
+  if (!add_nodes.empty() || !add_edges.empty()) {
+    auto added = EstimateForAdmission(changes->candidate, validated->edge_contracts, factory_, reject_unbudgeted,
+                                      add_nodes, add_edges);
+    if (!added.ok()) {
+      session_.scheduler().AbandonCandidate(**built);
+      return added.status();
+    }
+    p.added = std::move(*added);
+  }
+  if (!rm_nodes.empty() || !rm_edges.empty()) {
+    auto removed = EstimateForAdmission(base.spec(), base.validated().edge_contracts, factory_, false, rm_nodes,
+                                        rm_edges);
+    if (removed.ok()) p.removed = std::move(*removed);
+  }
+  if (Status s = session_.ReserveResources(p.added, "mutation v" + std::to_string(version)); !s.ok()) {
     session_.scheduler().AbandonCandidate(**built);
     return s;
   }
-  Prepared p;
+  // A7 warm-up.
+  if (Status s = session_.scheduler().OpenNodes(**built); !s.ok()) {
+    session_.scheduler().AbandonCandidate(**built);
+    session_.ReturnResources(p.added);
+    return s;
+  }
   p.candidate = std::move(*built);
   p.changes = std::move(*changes);
   p.diff = std::move(diff);
@@ -318,12 +376,14 @@ void MutationCoordinator::Execute(Merged batch) {
     NodeRuntime* node = prepared->candidate->FindNode(u.node);
     if (node == nullptr) {
       session_.scheduler().AbandonCandidate(*prepared->candidate);
+      session_.ReturnResources(prepared->added);
       FailAll(batch, Status::NotFound("set_node_options: node '" + u.node + "' not found"),
               "set_node_options");
       return;
     }
     if (!u.parameters.is_object()) {
       session_.scheduler().AbandonCandidate(*prepared->candidate);
+      session_.ReturnResources(prepared->added);
       FailAll(batch, Status::InvalidArgument("set_node_options: parameters must be an object"),
               "set_node_options");
       return;
@@ -332,6 +392,7 @@ void MutationCoordinator::Execute(Merged batch) {
     for (const auto& [k, _] : u.parameters.as_object()) {
       if (std::find(hot.begin(), hot.end(), k) == hot.end()) {
         session_.scheduler().AbandonCandidate(*prepared->candidate);
+        session_.ReturnResources(prepared->added);
         FailAll(batch,
                 Status::ParameterUnsupported("parameter '" + k + "' of node '" + u.node +
                                              "' is not hot-updatable"),
@@ -359,7 +420,12 @@ void MutationCoordinator::Execute(Merged batch) {
   detail["diff"] = prepared->diff.ToJson();
   detail["prepare_ms"] = JsonValue(std::chrono::duration<double, std::milli>(t_prepared - t0).count());
   const auto t_publish = std::chrono::steady_clock::now();
-  retire.on_complete = [registry, ops, published, detail = std::move(detail), t_publish](bool timed_out) {
+  Session* session = &session_;
+  retire.on_complete = [registry, ops, published, detail = std::move(detail), t_publish, session,
+                        removed = std::move(prepared->removed)](bool timed_out) {
+    // A6 counterpart: the retired version's nodes/edges are closed, their
+    // estimate goes back to the ledger.
+    session->ReturnResources(removed);
     JsonObject d = detail;
     d["retire_ms"] = JsonValue(
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_publish).count());
@@ -373,6 +439,7 @@ void MutationCoordinator::Execute(Merged batch) {
     // Stop() won the race after warm-up: same terminal state as the queued
     // requests CancelAll() dropped.
     session_.scheduler().AbandonCandidate(*prepared->candidate);
+    session_.ReturnResources(prepared->added);
     for (const MutationRequest& r : batch.origins) operations_.Cancel(r.operation, std::string(s.message()));
     return;
   }
@@ -388,15 +455,62 @@ Result<std::unique_ptr<Session>> Session::Create(const GraphSpec& spec, Operator
                                                  ExecutorPool& executor,
                                                  OperationRegistry& operations,
                                                  SessionOptions options, SessionEvents events) {
+  // A4–A5 once here; Build reuses the result.
+  GraphValidator validator([&factory](const OperatorKey& k) { return factory.Describe(k); });
+  auto validated = validator.Validate(spec);
+  if (!validated.ok()) return validated.status();
+  // A6 for the initial graph (12 §10.2): estimate -> reserve, before any
+  // operator instance exists, let alone opens.
+  ResourceLease lease;
+  if (options.resource_ledger != nullptr) {
+    auto amounts = EstimateForAdmission(spec, validated->edge_contracts, factory, options.reject_unbudgeted_edges);
+    if (!amounts.ok()) return amounts.status();
+    auto reserved = options.resource_ledger->Reserve(options.id, std::move(*amounts),
+                                                     "session " + std::to_string(options.id));
+    if (!reserved.ok()) return reserved.status();
+    lease = std::move(*reserved);
+  }
   RuntimeTopology::BuildOptions bo;
   bo.session_id = options.id;
   bo.version = 1;
   bo.aligned = options.aligned;
+  bo.validated = &*validated;
   auto topo = RuntimeTopology::Build(spec, factory, bo);
   if (!topo.ok()) return topo.status();
   std::unique_ptr<Session> s(new Session(std::move(*topo), factory, executor, operations,
                                          std::move(options), std::move(events)));
+  s->lease_ = std::move(lease);
   return s;
+}
+
+Status Session::ReserveResources(const std::vector<ResourceAmount>& delta, std::string_view purpose) {
+  if (delta.empty()) return Status::Ok();
+  std::lock_guard lock(lease_mutex_);
+  if (!lease_.active()) return Status::Ok();  // no ledger
+  std::vector<ResourceAmount> next = lease_.amounts();
+  next.insert(next.end(), delta.begin(), delta.end());
+  return lease_.Commit(MergeAmounts(std::move(next)), purpose);
+}
+
+void Session::ReturnResources(const std::vector<ResourceAmount>& delta) {
+  if (delta.empty()) return;
+  std::lock_guard lock(lease_mutex_);
+  if (!lease_.active()) return;
+  std::vector<ResourceAmount> next = lease_.amounts();
+  for (const ResourceAmount& d : delta) {
+    const auto it = std::find_if(next.begin(), next.end(), [&](const ResourceAmount& a) {
+      return a.kind == d.kind && a.device_id == d.device_id;
+    });
+    if (it == next.end()) continue;
+    it->amount = it->amount > d.amount ? it->amount - d.amount : 0;
+  }
+  // Shrinking never fails.
+  (void)lease_.Commit(MergeAmounts(std::move(next)), "retire");
+}
+
+std::vector<ResourceAmount> Session::HeldResources() const {
+  std::lock_guard lock(lease_mutex_);
+  return lease_.amounts();
 }
 
 Session::Session(std::shared_ptr<RuntimeTopology> topology, OperatorFactory& factory,
@@ -696,6 +810,18 @@ JsonValue Session::Snapshot() const {
   }
   o["edges"] = JsonValue(std::move(edges));
   o["pending_retirements"] = JsonValue(static_cast<std::uint64_t>(scheduler_.pending_retirements()));
+  {
+    // RES-2: what this session currently holds in the engine ledger.
+    JsonArray held;
+    for (const ResourceAmount& a : HeldResources()) {
+      JsonObject r;
+      r["kind"] = JsonValue(std::string(ToString(a.kind)));
+      r["device_id"] = JsonValue(static_cast<std::int64_t>(a.device_id));
+      r["amount"] = JsonValue(static_cast<std::int64_t>(a.amount));
+      held.emplace_back(std::move(r));
+    }
+    o["resources"] = JsonValue(std::move(held));
+  }
   return JsonValue(std::move(o));
 }
 

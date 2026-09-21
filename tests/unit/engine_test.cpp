@@ -108,10 +108,56 @@ TEST(EngineTest, ConfigFromJsonValidatesFields) {
   EXPECT_FALSE(ge::EngineConfig::FromJson(nullptr, R"({"cpu_threads":-1})", nullptr).ok());
   EXPECT_FALSE(ge::EngineConfig::FromJson(nullptr, nullptr, R"({"event_queue_capacity":0})").ok());
   EXPECT_FALSE(ge::EngineConfig::FromJson("not json", nullptr, nullptr).ok());
+  // TD-03 resource limits: kind[@device] -> capacity.
+  auto r = ge::EngineConfig::FromJson(
+      nullptr,
+      R"({"cpu_threads":2,"resources":{"cpu_threads":8,"host_memory_bytes":4096,"gpu_memory@1":99},"reject_unbudgeted_edges":true})",
+      nullptr);
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  ASSERT_EQ(r->resource_capacities.size(), 3U);  // object keys are sorted
+  EXPECT_EQ(r->resource_capacities[0].kind, ge::ResourceKind::kCpuThreads);
+  EXPECT_EQ(r->resource_capacities[0].capacity, 8U);
+  EXPECT_EQ(r->resource_capacities[1].kind, ge::ResourceKind::kGpuMemory);
+  EXPECT_EQ(r->resource_capacities[1].device_id, 1);
+  EXPECT_EQ(r->resource_capacities[2].kind, ge::ResourceKind::kHostMemory);
+  EXPECT_TRUE(r->reject_unbudgeted_edges);
+  EXPECT_FALSE(ge::EngineConfig::FromJson(nullptr, R"({"resources":{"unicorns":1}})", nullptr).ok());
+  EXPECT_FALSE(ge::EngineConfig::FromJson(nullptr, R"({"resources":{"gpu_memory":1}})", nullptr).ok());
+  EXPECT_FALSE(ge::EngineConfig::FromJson(nullptr, R"({"resources":{"cpu_threads":-1}})", nullptr).ok());
+  auto off = ge::EngineConfig::FromJson(nullptr, R"({"admission":false})", nullptr);
+  ASSERT_TRUE(off.ok());
+  EXPECT_FALSE(off->resource_admission);
   // A search path that is not a directory is refused at create.
   ge::EngineConfig bad = InlineConfig();
   bad.plugin_search_paths.emplace_back(PluginDir() / "does_not_exist");
   EXPECT_EQ(ge::Engine::Create(bad).status().code(), GE_STATUS_INVALID_ARGUMENT);
+}
+
+TEST(EngineTest, LedgerDefaultsFollowConfigAndSessionsReserve) {
+  ge::EngineConfig c = InlineConfig();
+  c.cpu_threads = 0;
+  c.resource_capacities = {{ge::ResourceKind::kCpuThreads, -1, 3}};
+  auto e = ge::Engine::Create(c);
+  ASSERT_TRUE(e.ok()) << e.status().ToString();
+  ge::ResourceLedger* ledger = (*e)->resource_ledger();
+  ASSERT_NE(ledger, nullptr);
+  EXPECT_EQ(ledger->Capacity(ge::ResourceKind::kCpuThreads, -1), 3U);
+  EXPECT_TRUE(ledger->Capacity(ge::ResourceKind::kHostMemory, -1).has_value());  // platform default
+  ASSERT_TRUE((*e)->LoadPlugin(PluginDir() / "sample_plugin.json").ok());
+  // Sample plugin operators declare no resources: the session holds a lease
+  // with nothing in it.
+  auto s = (*e)->CreateSession(Linear("g", 5));
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  EXPECT_EQ(ledger->live_leases(), 1U);
+  EXPECT_TRUE((*s)->HeldResources().empty());
+  ASSERT_TRUE((*e)->DestroySession((*s)->id()).ok());
+  EXPECT_EQ(ledger->live_leases(), 0U);
+
+  ge::EngineConfig off = InlineConfig();
+  off.resource_admission = false;
+  auto e2 = ge::Engine::Create(off);
+  ASSERT_TRUE(e2.ok());
+  EXPECT_EQ((*e2)->resource_ledger(), nullptr);
 }
 
 TEST(EngineTest, RejectedPluginsDoNotAffectLoadedOnes) {

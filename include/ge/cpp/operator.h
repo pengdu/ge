@@ -12,6 +12,7 @@
 #include <ge/cpp/capability.h>
 #include <ge/cpp/graph_validator.h>
 #include <ge/cpp/packet.h>
+#include <ge/cpp/resource_ledger.h>
 #include <ge/cpp/types.h>
 
 namespace ge {
@@ -168,15 +169,24 @@ class OperatorFactory {
   virtual ~OperatorFactory() = default;
   [[nodiscard]] virtual const CapabilityDescriptor* Describe(const OperatorKey& key) const = 0;
   [[nodiscard]] virtual Result<std::unique_ptr<Operator>> Create(const OperatorCreateArgs& args) = 0;
+  // TD-03 / 12 §10.2 "Estimate(Node)": what one instance with these options
+  // will take. Default: the descriptor's static resources.amounts (empty
+  // for an unknown key). Builtins may register a per-instance estimator
+  // (OnnxInfer: intra_threads x workers, model size).
+  [[nodiscard]] virtual std::vector<ResourceAmount> Estimate(const OperatorKey& key,
+                                                             const JsonValue& options) const;
 };
 
 // Simple in-memory factory for builtin/test operators.
 class BuiltinOperatorFactory final : public OperatorFactory {
  public:
   using Maker = std::function<std::unique_ptr<Operator>(const OperatorCreateArgs&)>;
-  void Register(CapabilityDescriptor descriptor, Maker maker);
+  using Estimator = std::function<std::vector<ResourceAmount>(const CapabilityDescriptor&, const JsonValue& options)>;
+  void Register(CapabilityDescriptor descriptor, Maker maker, Estimator estimator = nullptr);
   [[nodiscard]] const CapabilityDescriptor* Describe(const OperatorKey& key) const override;
   [[nodiscard]] Result<std::unique_ptr<Operator>> Create(const OperatorCreateArgs& args) override;
+  [[nodiscard]] std::vector<ResourceAmount> Estimate(const OperatorKey& key,
+                                                     const JsonValue& options) const override;
   [[nodiscard]] CapabilityResolver resolver() const {
     return [this](const OperatorKey& k) { return Describe(k); };
   }
@@ -185,6 +195,7 @@ class BuiltinOperatorFactory final : public OperatorFactory {
   struct Entry {
     CapabilityDescriptor descriptor;
     Maker maker;
+    Estimator estimator;
   };
   std::vector<Entry> entries_;
 };
@@ -197,6 +208,8 @@ class CompositeOperatorFactory final : public OperatorFactory {
   void Add(OperatorFactory* factory) { factories_.push_back(factory); }
   [[nodiscard]] const CapabilityDescriptor* Describe(const OperatorKey& key) const override;
   [[nodiscard]] Result<std::unique_ptr<Operator>> Create(const OperatorCreateArgs& args) override;
+  [[nodiscard]] std::vector<ResourceAmount> Estimate(const OperatorKey& key,
+                                                     const JsonValue& options) const override;
   [[nodiscard]] CapabilityResolver resolver() const {
     return [this](const OperatorKey& k) { return Describe(k); };
   }

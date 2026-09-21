@@ -253,6 +253,29 @@ TEST(OnnxInferTest, CapabilityIsAsyncTensorToTensor) {
   EXPECT_EQ(*parsed, d);
 }
 
+TEST(OnnxInferTest, EstimateFollowsThreadsWorkersAndModelSize) {
+  ge::BuiltinOperatorFactory factory;
+  ge::infer::RegisterOnnxInfer(factory);
+  const ge::OperatorKey key = *ge::OperatorKey::Parse(ge::infer::kOpOnnxInfer);
+  // No options: descriptor default (1 thread), no model -> no memory claim.
+  auto base = factory.Estimate(key, ge::JsonValue(ge::JsonObject{}));
+  ASSERT_EQ(base.size(), 1U);
+  EXPECT_EQ(base[0].kind, ge::ResourceKind::kCpuThreads);
+  EXPECT_EQ(base[0].amount, 1U);
+  auto threaded = factory.Estimate(
+      key, ge::JsonValue(ge::JsonObject{{"intra_threads", ge::JsonValue(3)}, {"workers", ge::JsonValue(2)},
+                                        {"model", ge::JsonValue("/nonexistent.onnx")}}));
+  ASSERT_EQ(threaded.size(), 1U);
+  EXPECT_EQ(threaded[0].amount, 6U);
+  if (ModelPath()[0] == '\0') GTEST_SKIP() << "no model";
+  auto sized = factory.Estimate(key, ge::JsonValue(ge::JsonObject{{"model", ge::JsonValue(ModelPath())}}));
+  ASSERT_EQ(sized.size(), 2U);
+  EXPECT_EQ(sized[1].kind, ge::ResourceKind::kHostMemory);
+  EXPECT_GT(sized[1].amount, 10ULL << 20);  // 2 x 14 MB
+  // Unknown key: nothing.
+  EXPECT_TRUE(factory.Estimate(*ge::OperatorKey::Parse("Nope@1.0.0"), ge::JsonValue(ge::JsonObject{})).empty());
+}
+
 TEST(OnnxInferTest, OpenRejectsMissingOrBadModel) {
   if (!ge::infer::OnnxRuntimeAvailable()) GTEST_SKIP();
   for (const ge::JsonValue& opts : {ge::JsonValue(ge::JsonObject{}),

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,7 @@
 #include <ge/cpp/mutation_applier.h>
 #include <ge/cpp/operation.h>
 #include <ge/cpp/operator.h>
+#include <ge/cpp/resource_ledger.h>
 #include <ge/cpp/runtime_topology.h>
 #include <ge/cpp/scheduler.h>
 #include <ge/cpp/types.h>
@@ -51,6 +53,15 @@ struct SessionOptions {
   AsyncRuntime* async_runtime = nullptr;
   // ASY-7 session-level batching switch.
   bool batching = true;
+  // 12 §10 / TD-03: shared engine ledger (null: no admission). Session::Create
+  // reserves the initial graph; every mutation reserves its added nodes and
+  // edges at Prepare A6 and returns the removed ones when their retire
+  // completes. Rejections are RESOURCE_EXHAUSTED with RES-3 context.
+  ResourceLedger* resource_ledger = nullptr;
+  // 12 §10.3: an edge whose packet bound cannot be derived (audio, bytes,
+  // json, custom tags without queue.max_packet_bytes) is rejected at
+  // admission instead of merely being left out of the budget.
+  bool reject_unbudgeted_edges = false;
 };
 
 struct SessionEvents {
@@ -117,6 +128,11 @@ class MutationCoordinator final {
     CandidateSpec changes;
     GraphDiff diff;
     RemovePolicy policy = RemovePolicy::kDrain;
+    // A6: estimate of the nodes/edges this version adds (reserved before
+    // warm-up, returned if warm-up or publish fails) and of the ones it
+    // removes (returned when the retire completes).
+    std::vector<ResourceAmount> added;
+    std::vector<ResourceAmount> removed;
   };
 
   Merged TakeBatch();  // queue_mutex_ held by caller? no: locks internally
@@ -191,6 +207,14 @@ class Session final {
   // Internal (coordinator).
   [[nodiscard]] Scheduler& scheduler() noexcept { return scheduler_; }
   [[nodiscard]] const SessionOptions& options() const noexcept { return options_; }
+  // 12 §10 admission (RES-1..4). One lease per session holds the running
+  // sum of every live node/edge estimate; Prepare A6 grows it by the
+  // candidate's additions (all-or-nothing, RESOURCE_EXHAUSTED with RES-3
+  // context on failure) and a completed retire shrinks it by the removals.
+  // No ledger configured: both are no-ops.
+  [[nodiscard]] Status ReserveResources(const std::vector<ResourceAmount>& delta, std::string_view purpose);
+  void ReturnResources(const std::vector<ResourceAmount>& delta);
+  [[nodiscard]] std::vector<ResourceAmount> HeldResources() const;
   [[nodiscard]] SessionEvents& events() noexcept { return events_; }
   [[nodiscard]] bool AcceptsMutations() const noexcept {
     const SessionState s = state();
@@ -210,6 +234,10 @@ class Session final {
   SessionOptions options_;
   SessionEvents events_;
   OperationRegistry& operations_;
+  // Declared before the scheduler: retire callbacks return resources from
+  // scheduler threads and must find the lease alive.
+  mutable std::mutex lease_mutex_;
+  ResourceLease lease_;  // guarded by lease_mutex_; amounts() == everything live
   Scheduler scheduler_;
   MutationCoordinator coordinator_;
   std::shared_ptr<SessionCompletionSink> sink_;

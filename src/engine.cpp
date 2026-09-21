@@ -1,6 +1,7 @@
 #include <ge/cpp/engine.h>
 
 #include <algorithm>
+#include <charconv>
 #include <set>
 
 #include "clock.h"
@@ -59,6 +60,33 @@ Result<EngineConfig> EngineConfig::FromJson(const char* plugin_search_paths_json
     if (const auto b = doc.GetInteger("buffer_pool_bytes")) {
       if (*b < 0) return Status::InvalidArgument("buffer_pool_bytes must be >= 0");
       c.buffer_pool.max_cached_bytes = static_cast<std::size_t>(*b);
+    }
+    if (const auto a = doc.GetBool("admission")) c.resource_admission = *a;
+    if (const auto u = doc.GetBool("reject_unbudgeted_edges")) c.reject_unbudgeted_edges = *u;
+    if (const JsonValue* r = doc.Find("resources"); r != nullptr) {
+      // {"cpu_threads": 8, "host_memory_bytes": 1e9, "gpu_memory@0": ...}
+      if (!r->is_object()) return Status::InvalidArgument("resources must be an object");
+      for (const auto& [k, v] : r->as_object()) {
+        if (!v.is_integer() || v.as_integer() < 0) {
+          return Status::InvalidArgument("resources." + k + " must be a non-negative integer");
+        }
+        std::string_view key = k;
+        std::int32_t device = -1;
+        if (const auto at = key.rfind('@'); at != std::string_view::npos) {
+          const auto tail = key.substr(at + 1);
+          int dev = -1;
+          if (std::from_chars(tail.data(), tail.data() + tail.size(), dev).ec != std::errc{} || dev < 0) {
+            return Status::InvalidArgument("resources." + k + ": bad device suffix");
+          }
+          device = dev;
+          key = key.substr(0, at);
+        }
+        const auto kind = ParseResourceKind(key);
+        if (!kind) return Status::InvalidArgument("resources." + k + ": unknown resource kind");
+        if (IsPerDevice(*kind) && device < 0) return Status::InvalidArgument("resources." + k + ": needs @device");
+        if (!IsPerDevice(*kind)) device = -1;
+        c.resource_capacities.push_back({*kind, device, static_cast<std::uint64_t>(v.as_integer())});
+      }
     }
     if (const auto d = doc.GetInteger("drain_timeout_ms")) {
       if (*d <= 0) return Status::InvalidArgument("drain_timeout_ms must be > 0");
@@ -203,6 +231,21 @@ Engine::Engine(EngineConfig config)
     events_->Publish(std::move(ev));
   };
   executor_ = std::make_unique<ExecutorPool>(config_.cpu_threads);
+  if (config_.resource_admission) {
+    std::vector<ResourceCapacity> caps = ResourceLedger::DefaultCapacities(config_.cpu_threads);
+    // Explicit entries override the defaults (same kind/device) or add new ones.
+    for (const ResourceCapacity& c : config_.resource_capacities) {
+      const auto it = std::find_if(caps.begin(), caps.end(), [&](const ResourceCapacity& d) {
+        return d.kind == c.kind && d.device_id == c.device_id;
+      });
+      if (it == caps.end()) {
+        caps.push_back(c);
+      } else {
+        it->capacity = c.capacity;
+      }
+    }
+    ledger_ = std::make_unique<ResourceLedger>(std::move(caps));
+  }
   AsyncOptions ao = config_.async;
   ao.worker_thread = config_.async_worker_thread.value_or(config_.cpu_threads != 0);
   async_ = std::make_unique<AsyncRuntime>(ao);
@@ -470,6 +513,8 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
   so.drain_timeout = config_.default_drain_timeout;
   so.coordinator_thread = config_.cpu_threads != 0;
   so.async_runtime = async_.get();
+  so.resource_ledger = ledger_.get();
+  so.reject_unbudgeted_edges = config_.reject_unbudgeted_edges;
   if (const auto b = spec.options().extra.GetBool("batching")) so.batching = *b;
   SessionEvents ev;
   ev.on_state_changed = [this, sid](SessionState from, SessionState to) {

@@ -102,6 +102,7 @@ add_library (
   src/scheduler_retire.cpp
   src/async_runtime.cpp
   src/operation.cpp
+  src/resource_ledger.cpp
   src/session.cpp
   src/plugin_operator.cpp
   src/plugin_registry.cpp

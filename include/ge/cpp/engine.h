@@ -20,6 +20,7 @@
 #include <ge/cpp/operation.h>
 #include <ge/cpp/packet.h>
 #include <ge/cpp/plugin_registry.h>
+#include <ge/cpp/resource_ledger.h>
 #include <ge/cpp/scheduler.h>
 #include <ge/cpp/session.h>
 #include <ge/cpp/types.h>
@@ -44,6 +45,14 @@ struct EngineConfig {
   // the PluginRegistry by CreateSession/GetCapability; UpgradeOperator stays
   // plugin-only (builtins have no plugin lifecycle; use ReplaceNode).
   std::shared_ptr<OperatorFactory> builtin_operators;
+  // TD-03 (12 §10): ledger capacities. Empty means
+  // ResourceLedger::DefaultCapacities(cpu_threads) at construction;
+  // resource_limits_json `resources` overrides per (kind[@device]).
+  // `admission: false` disables the ledger entirely (no session ever
+  // reserves; RES-1..4 off).
+  std::vector<ResourceCapacity> resource_capacities;
+  bool resource_admission = true;
+  bool reject_unbudgeted_edges = false;
 
   // ge_engine_config JSON fields (13 §5.1).
   [[nodiscard]] static Result<EngineConfig> FromJson(const char* plugin_search_paths_json,
@@ -116,6 +125,8 @@ class Engine final {
   [[nodiscard]] ExecutorPool& executor() noexcept { return *executor_; }
   [[nodiscard]] AsyncRuntime& async_runtime() noexcept { return *async_; }
   [[nodiscard]] const std::shared_ptr<HostBufferPool>& buffer_pool() const noexcept { return pool_; }
+  // Null when resource_admission == false.
+  [[nodiscard]] ResourceLedger* resource_ledger() noexcept { return ledger_.get(); }
   [[nodiscard]] const EngineConfig& config() const noexcept { return config_; }
 
  private:
@@ -133,6 +144,7 @@ class Engine final {
 
   EngineConfig config_;
   std::shared_ptr<HostBufferPool> pool_;
+  std::unique_ptr<ResourceLedger> ledger_;
   std::unique_ptr<EventBus> events_;
   std::unique_ptr<PluginRegistry> plugins_;
   CompositeOperatorFactory factory_;  // builtin_operators, then plugins_

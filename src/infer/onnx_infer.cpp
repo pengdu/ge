@@ -1,10 +1,12 @@
 // OnnxInfer: asynchronous ONNX Runtime backend (include/ge/infer/onnx.h).
 #include <ge/infer/onnx.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -444,6 +446,26 @@ std::string_view OnnxRuntimeVersion() noexcept { return ""; }
 
 #endif
 
-void RegisterOnnxInfer(BuiltinOperatorFactory& factory) { factory.Register(OnnxInferCapability(), &MakeOnnxInfer); }
+std::vector<ResourceAmount> EstimateOnnxInfer(const CapabilityDescriptor& cap, const JsonValue& options) {
+  std::vector<ResourceAmount> out = EstimateNodeResources(cap);
+  const std::int64_t intra = std::max<std::int64_t>(1, options.GetInteger("intra_threads").value_or(1));
+  const std::int64_t workers = std::max<std::int64_t>(1, options.GetInteger("workers").value_or(1));
+  for (ResourceAmount& a : out) {
+    if (a.kind == ResourceKind::kCpuThreads) a.amount = static_cast<std::uint64_t>(intra * workers);
+  }
+  if (const auto model = options.GetString("model"); model && !model->empty()) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(*model, ec);
+    if (!ec && size > 0) {
+      std::erase_if(out, [](const ResourceAmount& a) { return a.kind == ResourceKind::kHostMemory; });
+      out.push_back({ResourceKind::kHostMemory, -1, static_cast<std::uint64_t>(size) * 2});
+    }
+  }
+  return out;
+}
+
+void RegisterOnnxInfer(BuiltinOperatorFactory& factory) {
+  factory.Register(OnnxInferCapability(), &MakeOnnxInfer, &EstimateOnnxInfer);
+}
 
 }  // namespace ge::infer

@@ -109,9 +109,20 @@ struct Fixture {
                      [](const ge::OperatorCreateArgs& a) {
                        return std::make_unique<Faulty>(static_cast<int>(a.options.GetInteger("fail_at").value_or(1)));
                      });
-    factory.Register(Desc("BadOpen@1.0.0", {BytesPort("in", ge::PortDirection::kInput)},
-                          {BytesPort("out", ge::PortDirection::kOutput)}),
-                     [](const ge::OperatorCreateArgs&) { return std::make_unique<FailsToOpen>(); });
+    auto bad_open = Desc("BadOpen@1.0.0", {BytesPort("in", ge::PortDirection::kInput)},
+                         {BytesPort("out", ge::PortDirection::kOutput)});
+    bad_open.resources.amounts["cpu_threads"] = 1;
+    factory.Register(bad_open, [](const ge::OperatorCreateArgs&) { return std::make_unique<FailsToOpen>(); });
+    // TD-03: a pass-through that declares resources (12 §10.2 estimate).
+    auto heavy = Desc("Heavy@1.0.0", {BytesPort("in", ge::PortDirection::kInput)},
+                      {BytesPort("out", ge::PortDirection::kOutput, true, ge::PortCardinality::kMulti)}, false, 1);
+    heavy.resources.amounts["cpu_threads"] = 2;
+    heavy.resources.amounts["host_memory_bytes"] = 100;
+    factory.Register(heavy, [this](const ge::OperatorCreateArgs& a) {
+      auto p = std::make_shared<PassThrough>();
+      passes[a.external_id] = p.get();
+      return Keep(keep, p);
+    });
   }
 
   std::unique_ptr<ge::Session> Create(const ge::GraphSpec& spec, ge::ExecutorPool& exec,
@@ -769,6 +780,203 @@ TEST(SessionTest, SnapshotAndOperationQuery) {
   EXPECT_EQ(done.state, ge::OperationState::kSucceeded) << done.result.ToString();
   EXPECT_EQ(done.ToJson().GetString("state"), "succeeded");
   EXPECT_EQ(f.sinks["sink"]->Seqs(), Iota(10));
+}
+
+// ---------------------------------------------------------------------------
+// TD-03 resource admission (12 §10, RES-1..4)
+// ---------------------------------------------------------------------------
+
+ge::GraphSpec HeavyLinear(std::int64_t count) {
+  ge::GraphBuilder b("heavy");
+  auto src = b.AddNode(Op("Src@1.0.0"), "src", ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(count)}}));
+  auto h = b.AddNode(Op("Heavy@1.0.0"), "h");
+  auto sink = b.AddNode(Op("Sink@1.0.0"), "sink");
+  b.Connect(src.port("out"), h.port("in"), {.id = "e0"});
+  b.Connect(h.port("out"), sink.port("in"), {.id = "e1"});
+  return *b.Build();
+}
+
+std::uint64_t Reserved(const ge::ResourceLedger& l, ge::ResourceKind k) { return l.UsageOf(k, -1).reserved; }
+
+TEST(SessionTest, AdmissionReservesInitialGraphAndReturnsOnDestroy) {
+  Fixture f;
+  ge::ExecutorPool exec(0);
+  ge::ResourceLedger ledger({{ge::ResourceKind::kCpuThreads, -1, 3}, {ge::ResourceKind::kHostMemory, -1, 1000}});
+  ge::SessionOptions so;
+  so.resource_ledger = &ledger;
+  so.coordinator_thread = false;
+  auto a = ge::Session::Create(HeavyLinear(5), f.factory, exec, f.ops, so);
+  ASSERT_TRUE(a.ok()) << a.status().ToString();
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 2U);
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kHostMemory), 100U);
+  EXPECT_EQ(ledger.live_leases(), 1U);
+  // RES-2: the snapshot shows what the session holds.
+  const auto snap = (*a)->Snapshot();
+  const auto& held = snap.as_object().at("resources").as_array();
+  ASSERT_EQ(held.size(), 2U);
+  EXPECT_EQ(held[0].as_object().at("kind").as_string(), "cpu_threads");
+  EXPECT_EQ(held[0].as_object().at("amount").as_integer(), 2);
+
+  // Second session: cpu short (1 left, needs 2) -> all-or-nothing, RES-3.
+  so.id = 2;
+  auto b = ge::Session::Create(HeavyLinear(5), f.factory, exec, f.ops, so);
+  ASSERT_FALSE(b.ok());
+  EXPECT_EQ(b.status().code(), GE_STATUS_RESOURCE_EXHAUSTED);
+  EXPECT_TRUE(b.status().retryable());
+  const auto ctx = ge::ParseJson(b.status().context_json());
+  ASSERT_TRUE(ctx.ok());
+  const auto& shorts = ctx.value->as_object().at("short").as_array();
+  ASSERT_EQ(shorts.size(), 1U);
+  EXPECT_EQ(shorts[0].as_object().at("kind").as_string(), "cpu_threads");
+  EXPECT_EQ(shorts[0].as_object().at("requested").as_integer(), 2);
+  EXPECT_EQ(shorts[0].as_object().at("available").as_integer(), 1);
+  EXPECT_EQ(shorts[0].as_object().at("capacity").as_integer(), 3);
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kHostMemory), 100U);  // nothing taken
+
+  // The rejected session never existed; the first one still runs fine.
+  ASSERT_TRUE((*a)->Start().ok());
+  Drain(exec, **a);
+  EXPECT_EQ(f.sinks["sink"]->Seqs(), Iota(5));
+  a->reset();
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 0U);
+  EXPECT_EQ(ledger.live_leases(), 0U);
+  so.id = 3;
+  auto c = ge::Session::Create(HeavyLinear(5), f.factory, exec, f.ops, so);
+  EXPECT_TRUE(c.ok()) << c.status().ToString();
+}
+
+TEST(SessionTest, MutationReservesAdditionsAndReturnsRemovalsAfterRetire) {
+  Fixture f;
+  ge::ExecutorPool exec(0);
+  ge::ResourceLedger ledger({{ge::ResourceKind::kCpuThreads, -1, 3}});
+  ge::SessionOptions so;
+  so.resource_ledger = &ledger;
+  auto s = f.Create(Linear(-1), exec, so);  // Src/Pass/Sink declare nothing
+  ASSERT_TRUE(s->Start().ok());
+  for (int i = 0; i < 6; ++i) (void)exec.RunOne();
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 0U);
+
+  // A6: the inserted Heavy takes 2 of 3 at Prepare.
+  auto o1 = s->Apply(ge::Mutation().InsertChain("e1", {Node("h1", "Heavy@1.0.0")}).Build());
+  ASSERT_TRUE(o1.ok());
+  ASSERT_TRUE(s->PumpMutations());
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 2U);
+  EXPECT_EQ(s->topology_version(), 2U);
+  for (int i = 0; i < 20; ++i) (void)exec.RunOne();
+  s->Tick();
+  EXPECT_EQ(WaitOp(f.ops, *o1).state, ge::OperationState::kSucceeded);
+
+  // A second Heavy does not fit (1 left): rejected before warm-up, the
+  // running graph is untouched, nothing extra is reserved.
+  auto o2 = s->Apply(ge::Mutation().InsertChain("e0", {Node("h2", "Heavy@1.0.0")}).Build());
+  ASSERT_TRUE(o2.ok());
+  ASSERT_TRUE(s->PumpMutations());
+  const auto r2 = WaitOp(f.ops, *o2);
+  EXPECT_EQ(r2.result.code(), GE_STATUS_RESOURCE_EXHAUSTED) << r2.result.ToString();
+  EXPECT_NE(r2.result.context_json().find("\"purpose\":\"mutation v3\""), std::string::npos)
+      << r2.result.context_json();
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 2U);
+  EXPECT_EQ(s->topology_version(), 2U);
+  EXPECT_EQ(s->current_topology()->FindNode("h2"), nullptr);
+  EXPECT_EQ(s->scheduler().pending_retirements(), 0U);
+
+  // Removing h1 (drain) gives the 2 back only once the retire completes.
+  auto o3 = s->Apply(ge::Mutation().RemoveChain({"h1"}, {.bypass = true}).Build());
+  ASSERT_TRUE(o3.ok());
+  ASSERT_TRUE(s->PumpMutations());
+  ASSERT_EQ(s->topology_version(), 3U) << WaitOp(f.ops, *o3).result.ToString();
+  for (int i = 0; i < 200 && s->scheduler().pending_retirements() > 0; ++i) {
+    (void)exec.RunOne();
+    s->Tick();
+  }
+  EXPECT_EQ(WaitOp(f.ops, *o3).state, ge::OperationState::kSucceeded);
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 0U);
+
+  // Now h2 fits.
+  auto o4 = s->Apply(ge::Mutation().InsertChain("e0", {Node("h2", "Heavy@1.0.0")}).Build());
+  ASSERT_TRUE(o4.ok());
+  ASSERT_TRUE(s->PumpMutations());
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 2U);
+  EXPECT_EQ(s->topology_version(), 4U);
+  auto stop = s->Stop(true);
+  ASSERT_TRUE(stop.ok());
+  Drain(exec, *s);
+  s.reset();
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 0U);
+}
+
+TEST(SessionTest, WarmupFailureReturnsReservation) {
+  Fixture f;
+  ge::ExecutorPool exec(0);
+  ge::ResourceLedger ledger({{ge::ResourceKind::kCpuThreads, -1, 1}});
+  ge::SessionOptions so;
+  so.resource_ledger = &ledger;
+  auto s = f.Create(Linear(50), exec, so);
+  ASSERT_TRUE(s->Start().ok());
+  for (int i = 0; i < 6; ++i) (void)exec.RunOne();
+  auto o1 = s->Apply(ge::Mutation().InsertChain("e1", {Node("w", "BadOpen@1.0.0")}).Build());
+  ASSERT_TRUE(o1.ok());
+  ASSERT_TRUE(s->PumpMutations());
+  EXPECT_EQ(WaitOp(f.ops, *o1).result.code(), GE_STATUS_NODE_WARMUP_FAILED);
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 0U);
+  // Replace p0 by a node that declares resources: the new instance is
+  // reserved up front, the old one is returned at retire.
+  auto o2 = s->Apply(ge::Mutation().ReplaceNode("p0", Op("Heavy@1.0.0")).Build());
+  ASSERT_TRUE(o2.ok());
+  ASSERT_TRUE(s->PumpMutations());
+  const auto r2 = WaitOp(f.ops, *o2);
+  EXPECT_EQ(r2.result.code(), GE_STATUS_RESOURCE_EXHAUSTED) << r2.result.ToString();  // needs 2 of 1
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kCpuThreads), 0U);
+  Drain(exec, *s);
+  EXPECT_EQ(f.sinks["sink"]->Seqs(), Iota(50));
+}
+
+TEST(SessionTest, EdgeBudgetFollowsMaxPacketBytes) {
+  Fixture f;
+  ge::ExecutorPool exec(0);
+  ge::ResourceLedger ledger({{ge::ResourceKind::kEdgeBufferBytes, -1, 10000}});
+  ge::SessionOptions so;
+  so.resource_ledger = &ledger;
+  so.coordinator_thread = false;
+  so.reject_unbudgeted_edges = true;
+  // Bytes edges have no derivable bound: rejected when the deployment insists.
+  auto r = ge::Session::Create(Linear(5), f.factory, exec, f.ops, so);
+  ASSERT_FALSE(r.ok());
+  EXPECT_EQ(r.status().code(), GE_STATUS_GRAPH_INVALID);
+  EXPECT_NE(r.status().context_json().find("unbudgeted_edges"), std::string::npos);
+  EXPECT_EQ(ledger.live_leases(), 0U);
+
+  // Explicit bounds: capacity x max_packet_bytes per edge (12 §10.3).
+  ge::GraphBuilder b("budget");
+  auto src = b.AddNode(Op("Src@1.0.0"), "src", ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(5)}}));
+  auto p0 = b.AddNode(Op("Pass@1.0.0"), "p0");
+  auto sink = b.AddNode(Op("Sink@1.0.0"), "sink");
+  b.Connect(src.port("out"), p0.port("in"), {.id = "e0", .queue = {.capacity = 8, .max_packet_bytes = 500}});
+  b.Connect(p0.port("out"), sink.port("in"), {.id = "e1", .queue = {.capacity = 4, .max_packet_bytes = 1000}});
+  auto ok = ge::Session::Create(*b.Build(), f.factory, exec, f.ops, so);
+  ASSERT_TRUE(ok.ok()) << ok.status().ToString();
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kEdgeBufferBytes), 8000U);
+  // One more edge of 4 x 1000 would exceed the 10000 budget.
+  ASSERT_TRUE((*ok)->Start().ok());
+  auto o = (*ok)->Apply(ge::Mutation()
+                            .AddNode(Node("sink2", "Sink@1.0.0"))
+                            .AddEdge({"p0", "out"}, {"sink2", "in"},
+                                     {.id = "e2", .queue = {.capacity = 4, .max_packet_bytes = 1000}})
+                            .Build());
+  ASSERT_TRUE(o.ok());
+  ASSERT_TRUE((*ok)->PumpMutations());
+  EXPECT_EQ(WaitOp(f.ops, *o).result.code(), GE_STATUS_RESOURCE_EXHAUSTED);
+  EXPECT_EQ(Reserved(ledger, ge::ResourceKind::kEdgeBufferBytes), 8000U);
+  Drain(exec, **ok);
+  EXPECT_EQ(f.sinks["sink"]->Seqs(), Iota(5));
+}
+
+TEST(SessionTest, NoLedgerMeansNoAdmission) {
+  Fixture f;
+  ge::ExecutorPool exec(0);
+  auto s = f.Create(HeavyLinear(5), exec);
+  EXPECT_TRUE(s->HeldResources().empty());
+  EXPECT_TRUE(s->Snapshot().as_object().at("resources").as_array().empty());
 }
 
 }  // namespace

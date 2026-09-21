@@ -302,15 +302,32 @@ Status Operator::Submit(const SubmitRequest&) {
 // BuiltinOperatorFactory
 // ---------------------------------------------------------------------------
 
-void BuiltinOperatorFactory::Register(CapabilityDescriptor descriptor, Maker maker) {
+std::vector<ResourceAmount> OperatorFactory::Estimate(const OperatorKey& key, const JsonValue&) const {
+  const CapabilityDescriptor* d = Describe(key);
+  if (d == nullptr) return {};
+  return EstimateNodeResources(*d);
+}
+
+void BuiltinOperatorFactory::Register(CapabilityDescriptor descriptor, Maker maker, Estimator estimator) {
   for (Entry& e : entries_) {
     if (e.descriptor.op == descriptor.op) {
       e.descriptor = std::move(descriptor);
       e.maker = std::move(maker);
+      e.estimator = std::move(estimator);
       return;
     }
   }
-  entries_.push_back({std::move(descriptor), std::move(maker)});
+  entries_.push_back({std::move(descriptor), std::move(maker), std::move(estimator)});
+}
+
+std::vector<ResourceAmount> BuiltinOperatorFactory::Estimate(const OperatorKey& key,
+                                                             const JsonValue& options) const {
+  for (const Entry& e : entries_) {
+    if (e.descriptor.op != key) continue;
+    if (e.estimator) return MergeAmounts(e.estimator(e.descriptor, options));
+    return EstimateNodeResources(e.descriptor);
+  }
+  return {};
 }
 
 const CapabilityDescriptor* BuiltinOperatorFactory::Describe(const OperatorKey& key) const {
@@ -343,6 +360,14 @@ Result<std::unique_ptr<Operator>> CompositeOperatorFactory::Create(const Operato
     if (f->Describe(args.key) != nullptr) return f->Create(args);
   }
   return Status::NotFound("operator '" + args.key.ToString() + "' not found");
+}
+
+std::vector<ResourceAmount> CompositeOperatorFactory::Estimate(const OperatorKey& key,
+                                                               const JsonValue& options) const {
+  for (OperatorFactory* f : factories_) {
+    if (f->Describe(key) != nullptr) return f->Estimate(key, options);
+  }
+  return {};
 }
 
 }  // namespace ge

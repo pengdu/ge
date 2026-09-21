@@ -30,6 +30,7 @@
 
 #include <memory>
 #include <string_view>
+#include <vector>
 
 #include <ge/cpp/capability.h>
 #include <ge/cpp/operator.h>
@@ -40,6 +41,11 @@ inline constexpr std::string_view kOpOnnxInfer = "OnnxInfer@1.0.0";
 
 [[nodiscard]] CapabilityDescriptor OnnxInferCapability();
 [[nodiscard]] std::unique_ptr<Operator> MakeOnnxInfer(const OperatorCreateArgs& args);
+// TD-03 per-instance estimate (12 §10.2): cpu_threads = intra_threads x
+// workers; host_memory = 2 x model file size (weights + ORT arena) when the
+// file can be stat'ed, else the descriptor's static amount.
+[[nodiscard]] std::vector<ResourceAmount> EstimateOnnxInfer(const CapabilityDescriptor& cap,
+                                                            const JsonValue& options);
 void RegisterOnnxInfer(BuiltinOperatorFactory& factory);
 
 // Build-time probe so tests can skip when ge_infer was built without ORT.
