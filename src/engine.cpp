@@ -538,7 +538,15 @@ Status Engine::DestroySession(SessionId id) {
       (void)s->WaitStopped(std::chrono::milliseconds(5000));
     }
   }
+  // The watchdog's Tick() may still hold a snapshot reference; the plugin
+  // leases are only released by ~Session, and CompletePendingUnloads()
+  // below must observe that, so wait for the last reference to drop.
+  std::weak_ptr<Session> weak = s;
   s.reset();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!weak.expired() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   CompletePendingUnloads();
   return Status::Ok();
 }

@@ -174,20 +174,20 @@ std::shared_ptr<SessionCompletionSink> AsyncRuntime::AttachSession(SessionId ses
                                                                    bool batching) {
   auto sink = std::make_shared<SessionCompletionSink>(*this, session);
   std::lock_guard lock(state_mutex_);
-  sessions_[session] = SessionEntry{sink, std::move(hooks), batching};
+  sessions_[session] = SessionEntry{sink, std::move(hooks), batching, std::make_shared<HookGuard>()};
   return sink;
 }
 
 void AsyncRuntime::DetachSession(SessionId session) {
   std::shared_ptr<SessionCompletionSink> sink;
-  AsyncSessionHooks hooks;
+  SessionEntry entry;
   std::vector<Entry> dropped;
   {
     std::lock_guard lock(state_mutex_);
     const auto it = sessions_.find(session);
     if (it == sessions_.end()) return;
-    sink = it->second.sink;
-    hooks = std::move(it->second.hooks);
+    entry = std::move(it->second);
+    sink = entry.sink;
     sink->Detach();
     sessions_.erase(it);
     // Parked (never submitted) requests of the session are discarded.
@@ -219,7 +219,14 @@ void AsyncRuntime::DetachSession(SessionId session) {
     in_flight_count_.fetch_sub(1, std::memory_order_relaxed);
     orphan_total_.fetch_add(1, std::memory_order_relaxed);
     e.node->metrics().orphan_completions.fetch_add(1, std::memory_order_relaxed);
-    if (e.node->EndAsync() && hooks.on_async_idle) hooks.on_async_idle(*e.node);
+    if (e.node->EndAsync()) entry.OnAsyncIdle(*e.node);
+  }
+  // Last: block until every hook snapshot still running on the consumer
+  // thread has returned, then make all of them no-ops. The caller
+  // (~Session) frees the Session right after this.
+  if (entry.guard) {
+    std::unique_lock lock(entry.guard->mutex);
+    entry.guard->alive = false;
   }
 }
 
@@ -377,7 +384,7 @@ void AsyncRuntime::FlushBatch(const BatchKey& key, std::vector<Pending> members)
     const NodeState s = f.node->state();
     if (s == NodeState::kFailed || s == NodeState::kClosed) continue;
     f.node->Fail(f.status);
-    if (f.session && f.session->hooks.on_node_failed) f.session->hooks.on_node_failed(*f.node, f.status);
+    if (f.session) f.session->OnNodeFailed(*f.node, f.status);
   }
 }
 
@@ -449,7 +456,7 @@ bool AsyncRuntime::RetryBlockedOutputs() {
       }
       if (const auto sit = sessions_.find(b.session); sit != sessions_.end()) session = sit->second;
     }
-    if (!report.targets.empty() && session && session->hooks.after_emit) session->hooks.after_emit(report);
+    if (!report.targets.empty() && session) session->AfterEmit(report);
   }
   return any;
 }
@@ -534,9 +541,7 @@ void AsyncRuntime::OnCompletion(CompletionEvent event) {
     const NodeState s = failed_node->state();
     if (s != NodeState::kFailed && s != NodeState::kClosed) {
       failed_node->Fail(failure);
-      if (failed_session && failed_session->hooks.on_node_failed) {
-        failed_session->hooks.on_node_failed(*failed_node, failure);
-      }
+      if (failed_session) failed_session->OnNodeFailed(*failed_node, failure);
     }
   }
 }
@@ -671,7 +676,7 @@ void AsyncRuntime::DeliverEntry(Entry& entry, const SessionEntry* session) {
       slot.pushes.insert(slot.pushes.end(), parked.pushes.begin(), parked.pushes.end());
     }
   }
-  if (session != nullptr && session->hooks.after_emit) session->hooks.after_emit(report);
+  if (session != nullptr) session->AfterEmit(report);
 }
 
 void AsyncRuntime::EmitGap(Entry& entry, const SessionEntry* session) {
@@ -694,7 +699,7 @@ void AsyncRuntime::EmitGap(Entry& entry, const SessionEntry* session) {
     (void)PacketRouter::Emit(*entry.topology_ref, node, port, std::move(gap), entry.parameter,
                              &report);
   }
-  if (session != nullptr && session->hooks.after_emit) session->hooks.after_emit(report);
+  if (session != nullptr) session->AfterEmit(report);
 }
 
 void AsyncRuntime::FailNode(Entry& entry, const SessionEntry* session, const Status& status) {
@@ -702,13 +707,13 @@ void AsyncRuntime::FailNode(Entry& entry, const SessionEntry* session, const Sta
   const NodeState s = node.state();
   if (s == NodeState::kFailed || s == NodeState::kClosed) return;
   node.Fail(status);
-  if (session != nullptr && session->hooks.on_node_failed) session->hooks.on_node_failed(node, status);
+  if (session != nullptr) session->OnNodeFailed(node, status);
 }
 
 void AsyncRuntime::FinishEntry(Entry& entry, const SessionEntry* session) {
   NodeRuntime& node = *entry.node;
   const bool wake = node.EndAsync();
-  if (wake && session != nullptr && session->hooks.on_async_idle) session->hooks.on_async_idle(node);
+  if (wake && session != nullptr) session->OnAsyncIdle(node);
 }
 
 JsonValue AsyncRuntime::Stats() const {

@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -221,10 +222,34 @@ class AsyncRuntime final {
     std::uint32_t max_batch = 1;
   };
 
+  // Hooks capture the Session; the consumer thread invokes them with
+  // state_mutex_ released, so a concurrent ~Session -> DetachSession must
+  // wait for a hook already in flight before the Session memory goes away
+  // (ASan on Linux CI: OnAsyncNodeFailed -> Session::OnNodeFailed after
+  // the session was freed). |guard| is shared by the map entry and every
+  // snapshot: hooks run under a shared lock, DetachSession flips |alive|
+  // under an exclusive one and thereby waits for in-flight hooks. Hooks
+  // never call back into DetachSession, so there is no self-deadlock.
+  struct HookGuard {
+    std::shared_mutex mutex;
+    bool alive = true;
+  };
   struct SessionEntry {
     std::shared_ptr<SessionCompletionSink> sink;
     AsyncSessionHooks hooks;
     bool batching = true;
+    std::shared_ptr<HookGuard> guard;
+
+    template <typename Hook, typename... Args>
+    void Call(const Hook& hook, Args&&... args) const {
+      if (!hook || !guard) return;
+      std::shared_lock lock(guard->mutex);
+      if (!guard->alive) return;
+      hook(std::forward<Args>(args)...);
+    }
+    void AfterEmit(const EmitReport& report) const { Call(hooks.after_emit, report); }
+    void OnAsyncIdle(NodeRuntime& node) const { Call(hooks.on_async_idle, node); }
+    void OnNodeFailed(NodeRuntime& node, const Status& status) const { Call(hooks.on_node_failed, node, status); }
   };
 
   struct ReorderKey {
