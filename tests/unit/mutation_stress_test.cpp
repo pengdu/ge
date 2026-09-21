@@ -525,14 +525,9 @@ TEST(MutationStressTest, MutateWhilePausedThenResume) {
     ExpectSucceeded(f.ops, *add);
     EXPECT_EQ(s->state(), ge::SessionState::kPaused);
     // Pause gates the source; in-flight packets still drain to the sink.
-    // Wait for the count to settle before asserting it stays put.
-    std::size_t at_pause = f.Sink("sink")->Seqs().size();
-    for (int i = 0; i < 200; ++i) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      const std::size_t now = f.Sink("sink")->Seqs().size();
-      if (now == at_pause) break;
-      at_pause = now;
-    }
+    // Wait until nothing is in flight before asserting the count stays put.
+    ASSERT_TRUE(WaitDrained(*s->current_topology(), std::chrono::seconds(5))) << round;
+    const std::size_t at_pause = f.Sink("sink")->Seqs().size();
     std::this_thread::sleep_for(std::chrono::milliseconds(3));
     EXPECT_EQ(f.Sink("sink")->Seqs().size(), at_pause);  // still paused after the swap
     ASSERT_TRUE(s->Resume().ok());

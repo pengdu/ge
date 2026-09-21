@@ -11,6 +11,11 @@
 # failure or hang prints the tail of the offending log and exits 1.
 set -u
 
+# Tells the binaries they run under contention: timing budgets (PERF-1 in
+# ge_scheduler_test) are recorded but not enforced.
+GE_STRESS=1
+export GE_STRESS
+
 BIN=${1:?gtest binary}
 PARALLEL=${2:-8}
 REPEAT=${3:-10}

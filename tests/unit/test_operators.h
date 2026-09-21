@@ -11,8 +11,45 @@
 #include <vector>
 
 #include <ge/cpp/operator.h>
+#include <ge/cpp/runtime_topology.h>
 
 namespace ge::test {
+
+// True when no packet is in flight anywhere in |topo|: every node is
+// quiescent (no invoke task running or scheduled) and every edge is empty.
+// Scanned in topological order so a packet cannot slip behind the scan: it
+// can only outrun it, in which case it already reached its sink. Tests use
+// this instead of "the sink count stopped changing for N ms", which is a
+// timing guess that fails under CPU starvation (stress runs).
+inline bool DrainedOnce(const RuntimeTopology& topo) {
+  for (const std::string& id : topo.topological_order()) {
+    const NodeRuntime* n = topo.FindNode(id);
+    if (n == nullptr) continue;
+    if (!n->quiescent()) return false;
+    for (const EdgeChannelRef& e : topo.edges()) {
+      const auto producer = e->producer();
+      if (producer.get() == n && !e->empty()) return false;
+    }
+  }
+  return true;
+}
+
+// Waits until DrainedOnce() holds for |confirmations| consecutive scans.
+inline bool WaitDrained(const RuntimeTopology& topo, std::chrono::milliseconds timeout,
+                        int confirmations = 3) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  int clear = 0;
+  while (clear < confirmations) {
+    if (DrainedOnce(topo)) {
+      ++clear;
+    } else {
+      clear = 0;
+      if (std::chrono::steady_clock::now() > deadline) return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
 
 inline PortCapability BytesPort(const char* name, PortDirection dir, bool required = true,
                                 PortCardinality card = PortCardinality::kSingle) {

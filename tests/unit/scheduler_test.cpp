@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -408,15 +409,10 @@ TEST(SchedulerTest, PauseResume) {
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
   s.Pause();
   // Pause gates the source only: whatever is already queued on the edges
-  // still drains, so wait for the sink count to settle before asserting
+  // still drains, so wait until nothing is in flight before asserting
   // that nothing more arrives.
-  std::size_t a = f.sinks[0]->Seqs().size();
-  for (int i = 0; i < 200; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    const std::size_t now = f.sinks[0]->Seqs().size();
-    if (now == a) break;
-    a = now;
-  }
+  ASSERT_TRUE(WaitDrained(*topo, std::chrono::seconds(5)));
+  const std::size_t a = f.sinks[0]->Seqs().size();
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   const std::size_t b = f.sinks[0]->Seqs().size();
   EXPECT_EQ(a, b);
@@ -548,8 +544,12 @@ TEST(SchedulerTest, TenNodeLatencyAndSchedulingOverhead) {
   RecordProperty("per_packet_us", std::to_string(per_packet_us));
   RecordProperty("per_invoke_us", std::to_string(per_invoke_us));
 #ifdef NDEBUG
-  EXPECT_LT(per_packet_us, 50.0) << "10-node pipeline added latency per packet";
-  EXPECT_LT(per_invoke_us, 2.0) << "scheduling overhead per node invocation";
+  // The budgets (PERF-1) are for an unloaded machine; under the contention
+  // stress runner (8 copies per core) they are recorded but not enforced.
+  if (std::getenv("GE_STRESS") == nullptr) {
+    EXPECT_LT(per_packet_us, 50.0) << "10-node pipeline added latency per packet";
+    EXPECT_LT(per_invoke_us, 2.0) << "scheduling overhead per node invocation";
+  }
 #endif
 }
 
