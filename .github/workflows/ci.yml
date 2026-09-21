@@ -21,7 +21,9 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Stress runs (nightly / dispatch) live in their own group so they never
+  # cancel -- or get cancelled by -- the regular push/PR run of the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.stress)) && 'stress' || 'regular' }}
   cancel-in-progress: true
 
 env:
