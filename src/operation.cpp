@@ -84,32 +84,46 @@ void OperationRegistry::Cancel(OperationId id, std::string reason) {
          std::nullopt, std::nullopt);
 }
 
+void OperationRegistry::SetTerminalHook(TerminalHook hook) {
+  std::lock_guard lock(mutex_);
+  terminal_hook_ = std::move(hook);
+}
+
 void OperationRegistry::Finish(OperationId id, OperationState state, Status result,
                                JsonValue detail, std::optional<TopologyVersion> tv,
                                std::optional<ParameterVersion> pv) {
-  std::lock_guard lock(mutex_);
-  const auto it = records_.find(id);
-  if (it == records_.end() || it->second.terminal()) return;
-  OperationRecord& r = it->second;
-  r.state = state;
-  r.result = std::move(result);
-  if (tv) r.topology_version = tv;
-  if (pv) r.parameter_version = pv;
-  if (detail.is_object()) {
-    // JsonValue objects are shared by handle: a record copied out via Get()
-    // or Wait() still aliases r.detail, so it is replaced (copy-on-write)
-    // rather than mutated in place.
-    JsonObject merged = r.detail.is_object() ? r.detail.as_object() : JsonObject{};
-    for (const auto& [k, v] : detail.as_object()) merged[k] = v;
-    r.detail = JsonValue(std::move(merged));
+  TerminalHook hook;
+  OperationRecord snapshot;
+  {
+    std::lock_guard lock(mutex_);
+    const auto it = records_.find(id);
+    if (it == records_.end() || it->second.terminal()) return;
+    OperationRecord& r = it->second;
+    r.state = state;
+    r.result = std::move(result);
+    if (tv) r.topology_version = tv;
+    if (pv) r.parameter_version = pv;
+    if (detail.is_object()) {
+      // JsonValue objects are shared by handle: a record copied out via Get()
+      // or Wait() still aliases r.detail, so it is replaced (copy-on-write)
+      // rather than mutated in place.
+      JsonObject merged = r.detail.is_object() ? r.detail.as_object() : JsonObject{};
+      for (const auto& [k, v] : detail.as_object()) merged[k] = v;
+      r.detail = JsonValue(std::move(merged));
+    }
+    r.finished_ns = WallClockNs();
+    if (terminal_hook_) {
+      hook = terminal_hook_;
+      snapshot = r;
+    }
+    terminal_order_.push_back(id);
+    while (terminal_order_.size() > retain_terminal_) {
+      records_.erase(terminal_order_.front());
+      terminal_order_.erase(terminal_order_.begin());
+    }
+    cv_.notify_all();
   }
-  r.finished_ns = WallClockNs();
-  terminal_order_.push_back(id);
-  while (terminal_order_.size() > retain_terminal_) {
-    records_.erase(terminal_order_.front());
-    terminal_order_.erase(terminal_order_.begin());
-  }
-  cv_.notify_all();
+  if (hook) hook(snapshot);
 }
 
 std::optional<OperationRecord> OperationRegistry::Get(OperationId id) const {

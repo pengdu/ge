@@ -367,6 +367,24 @@ GE_EXPORT ge_status ge_engine_get_operation_json(ge_engine_handle engine, ge_ope
   });
 }
 
+GE_EXPORT ge_status ge_engine_query_audit_json(ge_engine_handle engine, const char* filter_json,
+                                               char** out_json) {
+  return Guarded([&]() -> ge_status {
+    if (engine == nullptr) return Invalid("engine is null");
+    if (out_json == nullptr) return Invalid("out_json is null");
+    ge::AuditFilter filter;
+    if (filter_json != nullptr && filter_json[0] != '\0') {
+      const auto parsed = ge::ParseJson(filter_json);
+      if (!parsed.ok()) return ToC(ge::Status::InvalidArgument("filter_json: " + parsed.error));
+      auto f = ge::AuditFilter::FromJson(*parsed.value);
+      if (!f.ok()) return ToC(f.status());
+      filter = *f;
+    }
+    *out_json = Dup(engine->engine->audit().QueryJson(filter).Serialize());
+    return ge::OkStatus();
+  });
+}
+
 GE_EXPORT ge_status ge_engine_get_capability_json(ge_engine_handle engine, const char* operator_key,
                                                   char** out_json) {
   return Guarded([&]() -> ge_status {

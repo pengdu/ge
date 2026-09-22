@@ -732,6 +732,101 @@ TEST(CApiTest, SessionCreateFailuresAndDestroyedHandles) {
   ge_session_destroy(s);
 }
 
+// AUD-1/2: control operations, plugin loads and node failures land in the
+// audit ring with the caller context, redacted, queryable through the C API.
+TEST(CApiTest, AuditRecordsOperationsPluginsAndNodeFailures) {
+  CEngine e;
+  ge_plugin_id v1 = 0;
+  const std::string good = (PluginDir() / "sample_plugin.json").string();
+  ASSERT_EQ(ge_engine_load_plugin(e.h, good.c_str(), &v1).code, GE_STATUS_OK);
+  ge_plugin_id bad = 0;
+  const std::string abi = (PluginDir() / "bad_abi_major.json").string();
+  EXPECT_EQ(ge_engine_load_plugin(e.h, abi.c_str(), &bad).code, GE_STATUS_PLUGIN_ABI_MISMATCH);
+
+  // A graph whose node options carry a secret and a URL with credentials.
+  ge::GraphBuilder g("aud");
+  auto src = g.AddNode(Op("Src@1.0.0"), "src",
+                       ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(20)},
+                                                    {"url", ge::JsonValue("rtmp://u:p@cdn/live?token=abc")},
+                                                    {"api_key", ge::JsonValue("K-123")}}));
+  auto pass = g.AddNode(Op("Pass@1.0.0"), "pass");
+  auto snk = g.AddNode(Op("Sink@1.0.0"), "sink");
+  g.Connect(src.port("out"), pass.port("in"), {.id = "e0"});
+  g.Connect(pass.port("out"), snk.port("in"), {.id = "e1"});
+  const std::string graph = ge::GraphSpecParser::ToJson(*g.Build()).Serialize();
+  ge_session_handle s = nullptr;
+  ge_operation_id create_op = 0;
+  ASSERT_EQ(ge_session_create(e.h, graph.c_str(), R"({"caller_id":"ops","request_id":"req-1"})", &s, &create_op).code,
+            GE_STATUS_OK);
+  ASSERT_EQ(ge_session_start(s).code, GE_STATUS_OK);
+  ge::Session* cpp = e.cpp().FindSession(1);
+  ASSERT_NE(cpp, nullptr);
+  RunSome(e.cpp(), cpp, 2);
+  // A failing parameter update (unknown node) and a node failure (fail_at).
+  ge_operation_id bad_op = 0;
+  EXPECT_NE(ge_session_set_node_parameters(s, 999, R"({"gain":1})", R"({"caller_id":"ops","request_id":"req-2"})",
+                                           nullptr, &bad_op).code,
+            GE_STATUS_OK);
+  ge_parameter_version pv = 0;
+  ge_operation_id set_op = 0;
+  ASSERT_EQ(ge_session_set_node_parameters(s, cpp->current_topology()->FindNode("pass")->id(), R"({"fail_at":10})",
+                                           R"({"caller_id":"ops","request_id":"req-3"})", &pv, &set_op).code,
+            GE_STATUS_OK);
+  for (int i = 0; i < 2000 && cpp->state() != ge::SessionState::kFailed; ++i) RunSome(e.cpp(), cpp, 1);
+  EXPECT_EQ(cpp->state(), ge::SessionState::kFailed);
+
+  char* json = nullptr;
+  ASSERT_EQ(ge_engine_query_audit_json(e.h, nullptr, &json).code, GE_STATUS_OK);
+  const std::string all = TakeString(e.h, json);
+  const auto parsed = ge::ParseJson(all);
+  ASSERT_TRUE(parsed.ok());
+  const auto& records = parsed.value->as_object().at("records").as_array();
+  std::map<std::string, int> ops;
+  for (const auto& r : records) ops[r.as_object().at("operation").as_string()]++;
+  EXPECT_EQ(ops["plugin.load"], 2);
+  EXPECT_EQ(ops["session.create"], 1);
+  EXPECT_EQ(ops["parameter.set"], 1);
+  EXPECT_EQ(ops["node.failed"], 1);
+  // AUD-2: the create digest carries the graph with secret/URL redacted.
+  EXPECT_EQ(all.find("K-123"), std::string::npos);
+  EXPECT_EQ(all.find("token=abc"), std::string::npos);
+  EXPECT_NE(all.find("rtmp://***@cdn/live"), std::string::npos);
+  EXPECT_NE(all.find("\"api_key\":\"***\""), std::string::npos);
+  // Caller context and target on the node failure.
+  for (const auto& r : records) {
+    const auto& o = r.as_object();
+    if (o.at("operation").as_string() == "node.failed") {
+      EXPECT_EQ(o.at("caller_id").as_string(), "ops");
+      EXPECT_EQ(o.at("request_id").as_string(), "req-1");
+      EXPECT_EQ(o.at("target").as_string(), "node:pass");
+      EXPECT_EQ(o.at("session_id").as_integer(), 1);
+      EXPECT_NE(o.at("result").as_string(), "OK");
+    }
+    if (o.at("operation").as_string() == "session.create") {
+      EXPECT_EQ(o.at("operation_id").as_integer(), static_cast<std::int64_t>(create_op));
+      EXPECT_EQ(o.at("topology_version").as_integer(), 1);
+    }
+  }
+  // Filters through the C API: failures only, by request id, paging.
+  ASSERT_EQ(ge_engine_query_audit_json(e.h, R"({"failures_only":true})", &json).code, GE_STATUS_OK);
+  const auto failures = ge::ParseJson(TakeString(e.h, json));
+  const auto& frec = failures.value->as_object().at("records").as_array();
+  EXPECT_GE(frec.size(), 2U);  // bad plugin + node failure (+ rejected set)
+  for (const auto& r : frec) EXPECT_NE(r.as_object().at("result").as_string(), "OK");
+  ASSERT_EQ(ge_engine_query_audit_json(e.h, R"({"request_id":"req-3"})", &json).code, GE_STATUS_OK);
+  EXPECT_EQ(ge::ParseJson(TakeString(e.h, json)).value->as_object().at("records").as_array().size(), 1U);
+  ASSERT_EQ(ge_engine_query_audit_json(e.h, R"({"limit":1})", &json).code, GE_STATUS_OK);
+  const auto page = ge::ParseJson(TakeString(e.h, json));
+  EXPECT_EQ(page.value->as_object().at("records").as_array().size(), 1U);
+  EXPECT_EQ(ge_engine_query_audit_json(e.h, "{bad", &json).code, GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ge_engine_query_audit_json(e.h, R"({"limit":-1})", &json).code, GE_STATUS_INVALID_ARGUMENT);
+  // Sink sees records live: destroying a failed session issues session.stop.
+  std::vector<std::string> sunk;
+  e.cpp().audit().SetSink([&](const ge::AuditRecord& r) { sunk.push_back(r.operation); });
+  ge_session_destroy(s);
+  EXPECT_EQ(sunk, std::vector<std::string>{"session.stop"});
+}
+
 TEST(CApiTest, RetireAndUpgradeThroughCApi) {
   CEngine e;
   ge_plugin_id v1 = 0;

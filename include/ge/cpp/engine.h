@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <ge/cpp/async_runtime.h>
+#include <ge/cpp/audit_log.h>
 #include <ge/cpp/event_bus.h>
 #include <ge/cpp/graph_spec.h>
 #include <ge/cpp/operation.h>
@@ -36,6 +37,8 @@ struct EngineConfig {
   bool watchdog_thread = true;
   EventBus::Options events;
   HostBufferPool::Options buffer_pool;
+  // AUD-1: audit ring capacity (observability_config_json `audit_capacity`).
+  std::size_t audit_capacity = 4096;
   std::optional<std::string> engine_fingerprint;  // tests only; default GE_BUILD_FINGERPRINT
   std::chrono::milliseconds default_drain_timeout{2000};
   // P5: async runtime (worker thread follows cpu_threads != 0 unless set).
@@ -121,6 +124,9 @@ class Engine final {
 
   [[nodiscard]] PluginRegistry& plugins() noexcept { return *plugins_; }
   [[nodiscard]] OperationRegistry& operations() noexcept { return operations_; }
+  // AUD-1/2: every terminal operation, resource rejection and node failure,
+  // redacted. Query with AuditFilter; sink for external log shipping.
+  [[nodiscard]] AuditLog& audit() noexcept { return audit_; }
   [[nodiscard]] EventBus& events() noexcept { return *events_; }
   [[nodiscard]] ExecutorPool& executor() noexcept { return *executor_; }
   [[nodiscard]] AsyncRuntime& async_runtime() noexcept { return *async_; }
@@ -151,6 +157,7 @@ class Engine final {
   std::unique_ptr<ExecutorPool> executor_;
   std::unique_ptr<AsyncRuntime> async_;
   OperationRegistry operations_;
+  AuditLog audit_;
   // shared_ptr, not unique_ptr: Tick()/StopAll() snapshot the sessions and
   // call into them outside sessions_mutex_, so a concurrent DestroySession
   // must not free a session the watchdog is still ticking (TSan, Linux CI).

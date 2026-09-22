@@ -713,11 +713,18 @@ void Session::OnNodeFailed(NodeRuntime& node, const Status& status) {
 }
 
 Result<OperationId> Session::Apply(MutationPatch patch, CallerContext caller) {
-  if (!AcceptsMutations()) return NotMutable();
-  if (patch.actions.empty()) return Status::InvalidArgument("patch has no actions");
   JsonObject d;
   d["patch"] = GraphSpecParser::ToJson(patch);
   const OperationId op = operations_.Create("mutation.apply", id(), caller, JsonValue(std::move(d)));
+  if (!AcceptsMutations()) {
+    operations_.Fail(op, NotMutable());
+    return NotMutable();
+  }
+  if (patch.actions.empty()) {
+    Status st = Status::InvalidArgument("patch has no actions");
+    operations_.Fail(op, st);
+    return st;
+  }
   coordinator_.Submit(MutationRequest{op, std::move(patch)});
   return op;
 }
@@ -729,16 +736,22 @@ Result<DryRunResult> Session::DryRun(const MutationPatch& patch) const {
 
 Result<ParameterUpdate> Session::SetParameters(std::string_view node_id, JsonValue parameters,
                                                CallerContext caller) {
-  if (!AcceptsMutations()) return NotMutable();
-  const std::shared_ptr<RuntimeTopology> topo = current_topology();
-  NodeRuntime* node = topo->FindNode(node_id);
-  if (node == nullptr) return Status::NotFound("node '" + std::string(node_id) + "' not found");
-  if (!parameters.is_object() || parameters.as_object().empty()) {
-    return Status::InvalidArgument("parameters must be a non-empty JSON object");
-  }
+  // AUD-1: rejected control requests are operations too (failed at once),
+  // so the audit trail carries every attempt with its caller context.
   const OperationId op = operations_.Create(
       "parameter.set", id(), std::move(caller),
       JsonValue(JsonObject{{"node", JsonValue(std::string(node_id))}, {"parameters", parameters}}));
+  const auto reject = [&](Status st) -> Result<ParameterUpdate> {
+    operations_.Fail(op, st);
+    return st;
+  };
+  if (!AcceptsMutations()) return reject(NotMutable());
+  const std::shared_ptr<RuntimeTopology> topo = current_topology();
+  NodeRuntime* node = topo->FindNode(node_id);
+  if (node == nullptr) return reject(Status::NotFound("node '" + std::string(node_id) + "' not found"));
+  if (!parameters.is_object() || parameters.as_object().empty()) {
+    return reject(Status::InvalidArgument("parameters must be a non-empty JSON object"));
+  }
   auto v = node->parameters().Submit(ParameterUpdateRequest{op, std::move(parameters)},
                                      node->capability().parameters.hot_updatable);
   if (!v.ok()) {

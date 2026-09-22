@@ -1,5 +1,7 @@
 #include <ge/cpp/engine.h>
 
+#include <ge/cpp/graph_spec_json.h>
+
 #include <algorithm>
 #include <charconv>
 #include <set>
@@ -126,6 +128,10 @@ Result<EngineConfig> EngineConfig::FromJson(const char* plugin_search_paths_json
       if (*w <= 0) return Status::InvalidArgument("watchdog_period_ms must be > 0");
       c.watchdog_period = std::chrono::milliseconds(*w);
     }
+    if (const auto a = doc.GetInteger("audit_capacity")) {
+      if (*a <= 0) return Status::InvalidArgument("audit_capacity must be > 0");
+      c.audit_capacity = static_cast<std::size_t>(*a);
+    }
   }
   return c;
 }
@@ -177,10 +183,44 @@ Result<std::unique_ptr<Engine>> Engine::Create(EngineConfig config) {
   return std::unique_ptr<Engine>(new Engine(std::move(config)));
 }
 
+namespace {
+
+// AUD-1: one audit record per terminal operation. The operation detail is
+// the digest (redacted by AuditLog::Append).
+AuditRecord AuditFromOperation(const OperationRecord& r) {
+  AuditRecord a;
+  a.caller = r.caller;
+  a.operation = r.kind;
+  a.session_id = r.session_id;
+  a.operation_id = r.id;
+  a.topology_version = r.topology_version;
+  a.parameter_version = r.parameter_version;
+  a.result = r.result.code();
+  a.message = r.result.message();
+  if (r.session_id != 0) {
+    a.target = "session:" + std::to_string(r.session_id);
+  } else if (const auto p = r.detail.GetInteger("plugin")) {
+    a.target = "plugin:" + std::to_string(*p);
+  } else {
+    a.target = "engine";
+  }
+  JsonObject d = r.detail.is_object() ? r.detail.as_object() : JsonObject{};
+  d["state"] = JsonValue(ToString(r.state));
+  if (!r.result.context_json().empty()) {
+    if (auto ctx = ParseJson(r.result.context_json()); ctx.ok()) d["error_context"] = *ctx.value;
+  }
+  a.digest = JsonValue(std::move(d));
+  return a;
+}
+
+}  // namespace
+
 Engine::Engine(EngineConfig config)
     : config_(std::move(config)),
       pool_(HostBufferPool::Create(config_.buffer_pool)),
-      events_(std::make_unique<EventBus>(config_.events)) {
+      events_(std::make_unique<EventBus>(config_.events)),
+      audit_(config_.audit_capacity) {
+  operations_.SetTerminalHook([this](const OperationRecord& r) { audit_.Append(AuditFromOperation(r)); });
   PluginRegistryOptions ro;
   ro.search_paths = config_.plugin_search_paths;
   ro.host_dependencies = config_.host_dependencies;
@@ -309,7 +349,28 @@ void Engine::PublishSessionEvent(SessionId session, std::string type, Severity s
 // ---------------------------------------------------------------------------
 
 Result<PluginInfo> Engine::LoadPlugin(const std::filesystem::path& manifest) {
-  return plugins_->Load(manifest);
+  auto r = plugins_->Load(manifest);
+  AuditRecord a;
+  a.operation = "plugin.load";
+  a.result = r.ok() ? GE_STATUS_OK : r.status().code();
+  JsonObject d;
+  d["manifest"] = JsonValue(manifest.string());
+  if (r.ok()) {
+    a.target = "plugin:" + std::to_string(r->id);
+    d["plugin"] = JsonValue(r->id);
+    d["plugin_id"] = JsonValue(r->plugin_id);
+    d["state"] = JsonValue(ToString(r->state));
+    if (r->state == PluginState::kRejected) {
+      a.result = r->rejection.code();
+      a.message = r->rejection.message();
+    }
+  } else {
+    a.target = "engine";
+    a.message = r.status().message();
+  }
+  a.digest = JsonValue(std::move(d));
+  audit_.Append(std::move(a));
+  return r;
 }
 
 Result<OperationId> Engine::RetirePlugin(PluginId id, RetirePluginOptions options,
@@ -504,8 +565,11 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
                                        OperationId* out_operation) {
   std::lock_guard lock(sessions_mutex_);
   const SessionId sid = next_session_id_++;
-  const OperationId op = operations_.Create("session.create", sid, caller,
-                                            JsonValue(JsonObject{{"graph", JsonValue(spec.name())}}));
+  // The full spec is the digest (node options may carry URLs / credentials:
+  // AuditLog redacts them, AUD-2).
+  const OperationId op = operations_.Create(
+      "session.create", sid, caller,
+      JsonValue(JsonObject{{"graph", JsonValue(spec.name())}, {"spec", GraphSpecParser::ToJson(spec)}}));
   if (out_operation != nullptr) *out_operation = op;
   operations_.SetRunning(op);
   SessionOptions so;
@@ -522,11 +586,27 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
                         JsonValue(JsonObject{{"from", JsonValue(ToString(from))},
                                              {"to", JsonValue(ToString(to))}}));
   };
-  ev.on_node_failed = [this, sid](NodeRuntime& node, const Status& status) {
+  ev.on_node_failed = [this, sid, caller](NodeRuntime& node, const Status& status) {
     PublishSessionEvent(sid, "node_failed", Severity::kError, node.id(),
                         JsonValue(JsonObject{{"node", JsonValue(node.external_id())},
                                              {"code", JsonValue(Status::CodeName(status.code()))},
                                              {"message", JsonValue(status.message())}}));
+    // AUD-1: node failures are audited under the session creator's context.
+    AuditRecord a;
+    a.caller = caller;
+    a.operation = "node.failed";
+    a.target = "node:" + node.external_id();
+    a.session_id = sid;
+    a.result = status.code();
+    a.message = status.message();
+    JsonObject d;
+    d["node"] = JsonValue(node.external_id());
+    d["op"] = JsonValue(node.operator_key().ToString());
+    if (!status.context_json().empty()) {
+      if (auto ctx = ParseJson(status.context_json()); ctx.ok()) d["error_context"] = *ctx.value;
+    }
+    a.digest = JsonValue(std::move(d));
+    audit_.Append(std::move(a));
   };
   ev.on_topology_published = [this, sid](TopologyVersion v) {
     PublishSessionEvent(sid, "mutation_state", Severity::kInfo, 0,

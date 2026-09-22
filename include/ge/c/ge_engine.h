@@ -76,6 +76,15 @@ GE_EXPORT ge_status ge_engine_get_capability_json(ge_engine_handle engine,
                                                   const char* operator_key,
                                                   char** out_json);
 
+/* AUD-1/2 (12 §12.3): redacted audit records. filter_json is an optional
+ * object {session_id, operation, caller_id, request_id, failures_only,
+ * since_ns, after_audit_id, limit}; NULL means everything retained. The
+ * result is {"records":[...], "last_audit_id":N, "dropped":N}; page with
+ * after_audit_id = last record's audit_id. Tail-appended (13 §3.1). */
+GE_EXPORT ge_status ge_engine_query_audit_json(ge_engine_handle engine,
+                                               const char* filter_json,
+                                               char** out_json);
+
 #ifdef __cplusplus
 }
 #endif

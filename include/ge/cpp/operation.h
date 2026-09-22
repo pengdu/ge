@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -46,6 +47,11 @@ class OperationRegistry final {
  public:
   explicit OperationRegistry(std::size_t retain_terminal = 1024);
 
+  // AUD-1: invoked once per operation, on the thread that moves it to a
+  // terminal state, outside the registry lock, with the final record.
+  using TerminalHook = std::function<void(const OperationRecord&)>;
+  void SetTerminalHook(TerminalHook hook);
+
   [[nodiscard]] OperationId Create(std::string kind, SessionId session, CallerContext caller,
                                    JsonValue detail = JsonValue(JsonObject{}));
   void SetRunning(OperationId id);
@@ -69,6 +75,7 @@ class OperationRegistry final {
 
   mutable std::mutex mutex_;
   mutable std::condition_variable cv_;
+  TerminalHook terminal_hook_;  // guarded by mutex_ (copied out before use)
   std::map<OperationId, OperationRecord> records_;
   std::vector<OperationId> terminal_order_;
   std::size_t retain_terminal_;
