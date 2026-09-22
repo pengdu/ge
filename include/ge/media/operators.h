@@ -66,6 +66,12 @@ void RegisterMediaOperators(BuiltinOperatorFactory& factory);
 // "mpeg4" fallback). Lets tests avoid hard-coding codec names.
 [[nodiscard]] std::string PreferredVideoEncoder(std::string_view codec = "h264");
 
+// FFmpeg's global log level (process-wide). Long runs (ge_soak) call
+// SetFfmpegLogLevel(FfmpegLogLevel::kError) so encoder statistics do not
+// flood the host log; default is FFmpeg's (info).
+enum class FfmpegLogLevel { kQuiet, kError, kWarning, kInfo };
+void SetFfmpegLogLevel(FfmpegLogLevel level) noexcept;
+
 }  // namespace ge::media
 
 #endif

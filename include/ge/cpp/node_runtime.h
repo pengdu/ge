@@ -88,10 +88,12 @@ class ParameterStore final {
 // ---------------------------------------------------------------------------
 
 // 12 §12.1 fixed-bucket, lock-free latency histogram. Bucket i holds
-// samples < 2^(i+10) ns (1µs .. ~33s), the last bucket everything above.
+// samples < 2^(i+10) ns: 1µs, 2µs, ... 2^34 ns (~17s) over 25 buckets, the
+// last bucket everything above (so end-to-end latencies of realtime
+// pipelines, seconds, still resolve to a bucket).
 class LatencyHistogram final {
  public:
-  static constexpr std::size_t kBuckets = 16;
+  static constexpr std::size_t kBuckets = 26;
   void Record(std::uint64_t ns) noexcept;
   [[nodiscard]] std::uint64_t count() const noexcept { return count_.load(std::memory_order_relaxed); }
   [[nodiscard]] std::uint64_t sum_ns() const noexcept { return sum_ns_.load(std::memory_order_relaxed); }

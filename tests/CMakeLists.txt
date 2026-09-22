@@ -180,6 +180,23 @@ ge_add_stress_test (ge_session_test)
 ge_add_stress_test (ge_flow_limiter_test)
 ge_add_stress_test (ge_onnx_infer_test "*Unbatched*:*Batched*:*TwoSessions*:*FastStop*")
 
+# 7x24 soak (15 §11 task 6): transcode + inference scenes on one threaded engine for --duration. The full runs are
+# `ge_soak --duration 24h` on a workstation and the 1h CI lane (sh ci/build.sh release soak); the ctest entry is a
+# 20 s smoke that keeps the binary compiling and the scenes wired, labelled "soak" so the regular run skips it.
+if (GE_ENABLE_MEDIA)
+  add_executable (ge_soak soak/ge_soak.cpp)
+  target_link_libraries (ge_soak PRIVATE ge_core ge_media ge_infer ge_test_flags)
+  if (EXISTS "${GE_MOBILENET_ONNX}")
+    target_compile_definitions (ge_soak PRIVATE "GE_SOAK_MODEL=\"${GE_MOBILENET_ONNX}\"")
+  else ()
+    target_compile_definitions (ge_soak PRIVATE "GE_SOAK_MODEL=\"\"")
+  endif ()
+  set (GE_SOAK_DURATION "20s" CACHE STRING "soak: ctest run length (ge_soak --duration)")
+  add_test (NAME ge_soak COMMAND ge_soak --duration ${GE_SOAK_DURATION} --report 5s --json
+                                 --out "${CMAKE_CURRENT_BINARY_DIR}/soak-out")
+  set_tests_properties (ge_soak PROPERTIES LABELS soak TIMEOUT 7200 RUN_SERIAL TRUE)
+endif ()
+
 # Performance baselines (15 §4/§5). Registered as a test so CI keeps the numbers; the budgets are only enforced on
 # optimised, non-sanitized builds.
 add_executable (ge_bench bench/ge_bench.cpp)

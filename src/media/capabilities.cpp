@@ -161,6 +161,15 @@ std::shared_ptr<BuiltinOperatorFactory> MakeMediaOperatorFactory() {
   return f;
 }
 
+void SetFfmpegLogLevel(FfmpegLogLevel level) noexcept {
+  switch (level) {
+    case FfmpegLogLevel::kQuiet: av_log_set_level(AV_LOG_QUIET); break;
+    case FfmpegLogLevel::kError: av_log_set_level(AV_LOG_ERROR); break;
+    case FfmpegLogLevel::kWarning: av_log_set_level(AV_LOG_WARNING); break;
+    case FfmpegLogLevel::kInfo: av_log_set_level(AV_LOG_INFO); break;
+  }
+}
+
 std::string PreferredVideoEncoder(std::string_view codec) {
   const AVCodec* c = FindVideoEncoder(codec, CodecBackend::kSoftware);
   return c == nullptr ? std::string() : std::string(c->name);

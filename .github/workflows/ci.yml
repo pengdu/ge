@@ -4,7 +4,9 @@
 # Ubuntu (Clang) and macOS (Apple clang, Homebrew FFmpeg 9) -- all running the
 # regular suite (ctest -LE stress).
 # Nightly: the contention stress suite (ctest -L stress) on the Linux
-# release and tsan trees.
+# release and tsan trees, plus the 1h ge_soak lane (ctest -L soak, docs/15
+# §11) on the Linux release tree. The 24h soak is run on a workstation
+# (ge_soak --duration 24h); GitHub-hosted jobs cap at 6h.
 name: ci
 
 on:
@@ -19,11 +21,19 @@ on:
         description: "run the stress suite instead of the regular one"
         type: boolean
         default: false
+      soak:
+        description: "run the 1h soak lane instead of the regular one"
+        type: boolean
+        default: false
+      soak_duration:
+        description: "ge_soak --duration for the soak lane (e.g. 1h, 30m, 5h)"
+        type: string
+        default: "1h"
 
 concurrency:
   # Stress runs (nightly / dispatch) live in their own group so they never
   # cancel -- or get cancelled by -- the regular push/PR run of the same ref.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.stress)) && 'stress' || 'regular' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.stress || inputs.soak))) && 'nightly' || 'regular' }}
   cancel-in-progress: true
 
 env:
@@ -31,7 +41,7 @@ env:
 
 jobs:
   linux:
-    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.stress)
+    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && (inputs.stress || inputs.soak))
     name: linux-${{ matrix.compiler }}-${{ matrix.lane }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -72,7 +82,7 @@ jobs:
           if-no-files-found: ignore
 
   macos:
-    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.stress)
+    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && (inputs.stress || inputs.soak))
     name: macos-release
     runs-on: macos-15
     timeout-minutes: 60
@@ -133,4 +143,38 @@ jobs:
           path: |
             build/ci-${{ matrix.lane }}/Testing/Temporary/LastTest.log
             build/stress-logs/
+          if-no-files-found: ignore
+
+  soak:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.soak)
+    name: soak-linux-gcc-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      CC: gcc
+      CXX: g++
+      PKG_CONFIG_PATH: /opt/onnxruntime/lib/pkgconfig
+      GE_SOAK_DURATION: ${{ github.event_name == 'workflow_dispatch' && inputs.soak_duration || '1h' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: /opt/onnxruntime
+          key: ort-linux-x64-${{ env.ORT_VERSION }}
+      - name: Cache test model
+        uses: actions/cache@v4
+        with:
+          path: build/models
+          key: models-mobilenetv2-12
+      - name: Install dependencies
+        run: sh ci/setup-ubuntu.sh
+      - name: Build and soak
+        run: sh ci/build.sh release soak
+      - name: Upload soak log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-linux-gcc-release
+          path: build/ci-release/Testing/Temporary/LastTest.log
           if-no-files-found: ignore

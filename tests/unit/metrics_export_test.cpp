@@ -39,7 +39,7 @@ TEST(PrometheusWriterTest, HistogramIsCumulativeInSecondsWithInf) {
   EXPECT_NE(out.find("t_lat_seconds_bucket{node=\"a\",le=\"+Inf\"} 3\n"), std::string::npos);
   EXPECT_NE(out.find("t_lat_seconds_sum{node=\"a\"} 0.003002\n"), std::string::npos);
   EXPECT_NE(out.find("t_lat_seconds_count{node=\"a\"} 3\n"), std::string::npos);
-  // 16 buckets, one line each, plus sum and count and two header lines.
+  // kBuckets lines, plus sum and count and two header lines.
   std::size_t lines = 0;
   for (const char c : out) {
     if (c == '\n') ++lines;
