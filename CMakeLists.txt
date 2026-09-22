@@ -85,6 +85,8 @@ add_library (
   src/json.cpp
   src/graph_spec.cpp
   src/graph_spec_json.cpp
+  src/graph_template.cpp
+  src/batch_runner.cpp
   src/capability.cpp
   src/graph_validator.cpp
   src/graph_diff.cpp

@@ -31,6 +31,11 @@ struct EncodeParams {
 //  * Publishes "media_format_changed" (12 §4.5) with the seq of the
 //    keyframe that starts a new configuration; the keyframe packet carries
 //    codecpar so lazily opened muxers can write their header from it.
+//  * |segment_duration_ms| (long-video splitting): every multiple of the
+//    duration past the first frame's pts forces an IDR whose packet is
+//    flagged GE_PACKET_FLAG_SEGMENT_START; a segmenting MediaMux starts a
+//    new independently playable file there. Boundaries are frame-accurate
+//    (the IDR is the first frame at or past the boundary).
 class VideoEncode final : public Operator {
  public:
   explicit VideoEncode(JsonValue options) : options_(std::move(options)) {}
@@ -42,6 +47,8 @@ class VideoEncode final : public Operator {
     preset_ = options_.GetString("preset").value_or("veryfast");
     fps_ = static_cast<int>(options_.GetInteger("fps").value_or(0));
     params_ = EncodeParams::From(&options_, EncodeParams{});
+    segment_duration_ns_ = options_.GetInteger("segment_duration_ms").value_or(0) * 1000000;
+    if (segment_duration_ns_ < 0) return Status::InvalidArgument(ctx_.Prefix() + "segment_duration_ms must be >= 0");
     if (const ConnectionContract* c = r.InputContract("in"); c != nullptr && c->video) in_pixel_ = c->video->pixel_format;
     encoder_ = FindVideoEncoder(codec_name_, CodecBackend::kSoftware);
     if (encoder_ == nullptr) return Status::NotFound(ctx_.Prefix() + "no encoder for codec '" + codec_name_ + "'");
@@ -74,10 +81,23 @@ class VideoEncode final : public Operator {
       copy->pts = ff::FromNs(in->header.pts_ns, codec_->time_base);
       // One IDR per parameter version that asks for it: a repeated
       // SetParameters({force_idr:true}) bumps the version and asks again.
-      if (force_idr && req.parameter_version != idr_served_version_) {
+      bool segment_split = false;
+      if (segment_duration_ns_ > 0 && in->header.pts_ns != INT64_MIN) {
+        if (next_split_ns_ == INT64_MIN) {
+          next_split_ns_ = in->header.pts_ns + segment_duration_ns_;
+        } else if (in->header.pts_ns >= next_split_ns_) {
+          segment_split = true;
+          while (next_split_ns_ <= in->header.pts_ns) next_split_ns_ += segment_duration_ns_;
+        }
+      }
+      if (segment_split || (force_idr && req.parameter_version != idr_served_version_)) {
         copy->pict_type = AV_PICTURE_TYPE_I;
         ff::SetKeyFrame(*copy, true);
-        idr_served_version_ = req.parameter_version;
+        if (force_idr) idr_served_version_ = req.parameter_version;
+        if (segment_split) {
+          segment_mark_from_ns_ = in->header.pts_ns;
+          segment_mark_pending_ = true;
+        }
       } else {
         copy->pict_type = AV_PICTURE_TYPE_NONE;
       }
@@ -169,8 +189,14 @@ class VideoEncode final : public Operator {
         config_announced_ = true;
       }
       pkt->time_base = codec_->time_base;
-      Packet out = MakePacket(WrapPacket(std::move(pkt)), Tag(kTagEncodedVideo), seq, pts_ns, dts_ns,
-                              key ? GE_PACKET_FLAG_KEYFRAME : 0u);
+      std::uint32_t flags = key ? GE_PACKET_FLAG_KEYFRAME : 0u;
+      // Zerolatency + no B-frames: output order == input order, so the
+      // first keyframe at or past the split frame's pts is the split.
+      if (segment_mark_pending_ && key && pts_ns >= segment_mark_from_ns_) {
+        flags |= GE_PACKET_FLAG_SEGMENT_START;
+        segment_mark_pending_ = false;
+      }
+      Packet out = MakePacket(WrapPacket(std::move(pkt)), Tag(kTagEncodedVideo), seq, pts_ns, dts_ns, flags);
       SetFormat(&out, format_, key ? &codecpar_ : nullptr);
       if (Status s = req.sink->Emit("out", std::move(out)); !s.ok()) return s;
     }
@@ -186,6 +212,10 @@ class VideoEncode final : public Operator {
   JsonValue codecpar_ = JsonValue(JsonObject{});
   MediaFormat format_;
   bool config_announced_ = false;
+  std::int64_t segment_duration_ns_ = 0;
+  std::int64_t next_split_ns_ = INT64_MIN;
+  std::int64_t segment_mark_from_ns_ = INT64_MIN;
+  bool segment_mark_pending_ = false;
   ParameterVersion idr_served_version_ = 0;
   std::int64_t frames_in_ = 0;
   PacketSeq seq_ = 0;

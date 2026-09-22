@@ -40,6 +40,10 @@ inline constexpr std::string_view kOpMediaMux = "MediaMux@1.0.0";
 // a new stream configuration (12 §4.5 / §12.2).
 inline constexpr std::string_view kEventMediaFormatChanged = "media_format_changed";
 
+// Event type published by a segmenting MediaMux (output_pattern) each time
+// it rotates to a new file: {index, path, start_pts_ns}.
+inline constexpr std::string_view kEventMediaSegment = "media_segment";
+
 // Capability descriptors (also used by tests to assert negotiation).
 [[nodiscard]] CapabilityDescriptor MediaDemuxCapability();
 [[nodiscard]] CapabilityDescriptor VideoDecodeCapability();

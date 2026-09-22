@@ -8,7 +8,9 @@
 #include <thread>
 #include <vector>
 
+#include <ge/cpp/batch_runner.h>
 #include <ge/cpp/engine.h>
+#include <ge/cpp/graph_template.h>
 #include <ge/cpp/mutation_applier.h>
 #include <ge/media/operators.h>
 #include <ge/media/rendition.h>
@@ -622,6 +624,184 @@ TEST(MediaTranscodeTest, ThreadedEngineRealtimeAddAndRemove) {
   EXPECT_GT(b.video_packets, 0);
   EXPECT_TRUE(b.first_video_is_key);
   EXPECT_TRUE(b.trailer_ok) << b.ToJson().Serialize();
+  EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
+}
+
+// GM-3 batch reuse: three inputs through one transcode template on one
+// engine. The template is validated/negotiated once; each item is its own
+// session (isolation), each output independently playable.
+TEST(MediaTranscodeTest, BatchTemplateTranscodesSeveralInputs) {
+  Fixture f("batch", 45);
+  // Two extra inputs with different frame counts.
+  std::vector<std::string> inputs{f.input};
+  std::vector<int> frames{45, 30, 60};
+  for (int i = 1; i < 3; ++i) {
+    SampleSpec spec;
+    spec.path = (f.dir / ("in" + std::to_string(i) + ".mp4")).string();
+    spec.frames = frames[static_cast<std::size_t>(i)];
+    auto s = GenerateSample(spec);
+    ASSERT_TRUE(s.ok()) << s.status().ToString();
+    inputs.push_back(spec.path);
+  }
+
+  RenditionTemplate::BaseOptions base;
+  base.input_path = "${input}";
+  RenditionSpec r;
+  r.id = "p180";
+  r.width = 320;
+  r.height = 180;
+  r.bitrate_kbps = 500;
+  r.gop = 30;
+  r.output_path = "${output}";
+  auto g = RenditionTemplate::Graph(base, {r});
+  ASSERT_TRUE(g.ok()) << g.status().ToString();
+  auto tmpl = ge::GraphTemplate::Create(std::move(*g), {ge::TemplateParameter{.name = "input"},
+                                                        ge::TemplateParameter{.name = "output"}});
+  ASSERT_TRUE(tmpl.ok()) << tmpl.status().ToString();
+  ASSERT_TRUE(f.engine->PrevalidateTemplate(*tmpl).ok());
+
+  ge::BatchOptions o;
+  o.concurrency = 2;
+  ge::BatchRunner runner(*f.engine, std::move(*tmpl), o);
+  std::vector<ge::BatchItem> items;
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    items.push_back(ge::BatchItem{
+        "v" + std::to_string(i),
+        ge::JsonValue(ge::JsonObject{{"input", ge::JsonValue(inputs[i])},
+                                     {"output", ge::JsonValue(f.Out(("batch" + std::to_string(i)).c_str(), "flv"))}})});
+  }
+  auto report = runner.Run(items);
+  ASSERT_TRUE(report.ok()) << report.status().ToString();
+  ASSERT_TRUE(report->ok()) << [&] {
+    std::string all;
+    for (const auto& it : report->items) all += it.name + ": " + it.status.ToString() + "; ";
+    return all;
+  }();
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    const ProbeResult pr = Probe(f.Out(("batch" + std::to_string(i)).c_str(), "flv"));
+    EXPECT_EQ(pr.video_packets, frames[i]) << i;
+    EXPECT_TRUE(pr.first_video_is_key) << i;
+    EXPECT_TRUE(pr.trailer_ok) << i;
+  }
+  EXPECT_TRUE(f.engine->Sessions().empty());
+}
+
+// Long-video splitting, parallel flavour: the same template with
+// start_ms/end_ms parameters cuts one input into slices; each slice is an
+// independent session/file starting at a keyframe.
+TEST(MediaTranscodeTest, SliceTemplateSplitsLongInputInParallel) {
+  Fixture f("slices", 90, 30);  // 3s at 30fps, gop 30 => keyframes at 0/1/2s
+  RenditionTemplate::BaseOptions base;
+  base.input_path = "${input}";
+  base.audio = false;
+  RenditionSpec r;
+  r.id = "p180";
+  r.width = 320;
+  r.height = 180;
+  r.bitrate_kbps = 500;
+  r.gop = 30;
+  r.audio = false;
+  r.output_path = "${output}";
+  auto g = RenditionTemplate::Graph(base, {r});
+  ASSERT_TRUE(g.ok()) << g.status().ToString();
+  ge::GraphSpec skeleton = std::move(*g);
+  ge::NodeSpec* demux = skeleton.FindNode(RenditionTemplate::kDemux);
+  ASSERT_NE(demux, nullptr);
+  demux->options.mutable_object().emplace("start_ms", ge::JsonValue("${start_ms}"));
+  demux->options.mutable_object().emplace("end_ms", ge::JsonValue("${end_ms}"));
+  auto tmpl = ge::GraphTemplate::Create(std::move(skeleton),
+                                        {ge::TemplateParameter{.name = "input"}, ge::TemplateParameter{.name = "output"},
+                                         ge::TemplateParameter{.name = "start_ms"}, ge::TemplateParameter{.name = "end_ms"}});
+  ASSERT_TRUE(tmpl.ok()) << tmpl.status().ToString();
+
+  ge::BatchOptions o;
+  o.concurrency = 3;
+  ge::BatchRunner runner(*f.engine, std::move(*tmpl), o);
+  std::vector<ge::BatchItem> items;
+  for (int i = 0; i < 3; ++i) {
+    items.push_back(ge::BatchItem{
+        "s" + std::to_string(i),
+        ge::JsonValue(ge::JsonObject{{"input", ge::JsonValue(f.input)},
+                                     {"output", ge::JsonValue(f.Out(("slice" + std::to_string(i)).c_str(), "mp4"))},
+                                     {"start_ms", ge::JsonValue(i * 1000)},
+                                     {"end_ms", ge::JsonValue(i == 2 ? 0 : (i + 1) * 1000)}})});
+  }
+  auto report = runner.Run(items);
+  ASSERT_TRUE(report.ok()) << report.status().ToString();
+  ASSERT_TRUE(report->ok()) << [&] {
+    std::string all;
+    for (const auto& it : report->items) all += it.name + ": " + it.status.ToString() + "; ";
+    return all;
+  }();
+  std::int64_t total = 0;
+  for (int i = 0; i < 3; ++i) {
+    const ProbeResult pr = Probe(f.Out(("slice" + std::to_string(i)).c_str(), "mp4"));
+    EXPECT_GT(pr.video_packets, 0) << i;
+    EXPECT_TRUE(pr.first_video_is_key) << i;
+    EXPECT_TRUE(pr.trailer_ok) << i;
+    total += pr.video_packets;
+  }
+  // Slices start on the keyframe at/before start_ms and end at end_ms:
+  // with gop == fps the boundaries are exact and nothing is lost.
+  EXPECT_EQ(total, 90);
+}
+
+// Long-video splitting, single-session flavour: segment_duration_ms on the
+// encoder + output_pattern on the mux produce N independently playable
+// files from one uninterrupted pipeline (decoder/encoder never reopen).
+TEST(MediaTranscodeTest, SegmentedMuxRotatesFilesOnEncoderBoundaries) {
+  Fixture f("segments", 90, 30);  // 3s
+  RenditionTemplate::BaseOptions base = f.Base();
+  RenditionSpec r = f.Rendition("seg", 320, 180, "mp4");
+  r.gop = 90;  // segments come from segment_duration_ms, not the gop
+  auto g = RenditionTemplate::Graph(base, {r});
+  ASSERT_TRUE(g.ok());
+  ge::GraphSpec spec = std::move(*g);
+  const RenditionNodeIds ids = RenditionTemplate::Ids("seg");
+  ge::NodeSpec* venc = spec.FindNode(ids.venc);
+  ASSERT_NE(venc, nullptr);
+  venc->options.mutable_object().emplace("segment_duration_ms", ge::JsonValue(1000));
+  ge::NodeSpec* mux = spec.FindNode(ids.mux);
+  ASSERT_NE(mux, nullptr);
+  mux->options.mutable_object().erase("output_path");
+  mux->options.mutable_object().emplace("output_pattern", ge::JsonValue((f.dir / "seg_%03d.mp4").string()));
+  mux->options.mutable_object().emplace("container", ge::JsonValue("mp4"));
+
+  std::vector<std::string> segment_paths;
+  std::mutex seg_mutex;
+  const ge::SubscriptionId sub = f.engine->events().Subscribe(
+      ge::EventFilter{.types = {std::string(kEventMediaSegment)}}, [&](const ge::Event& e) {
+        std::lock_guard lock(seg_mutex);
+        segment_paths.push_back(e.detail.GetString("path").value_or(""));
+      });
+
+  auto s = f.engine->CreateSession(spec);
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ge::Session* session = *s;
+  ASSERT_TRUE(session->Start().ok());
+  ASSERT_TRUE(f.RunToStop(session));
+  EXPECT_EQ(session->state(), ge::SessionState::kStopped) << session->failure().ToString();
+  f.engine->events().Cancel(sub);
+
+  std::int64_t total = 0;
+  for (int i = 0; i < 3; ++i) {
+    const std::string path = (f.dir / ("seg_00" + std::to_string(i) + ".mp4")).string();
+    const ProbeResult pr = Probe(path);
+    EXPECT_EQ(pr.video_packets, 30) << path;  // frame-accurate 1s boundaries
+    EXPECT_TRUE(pr.first_video_is_key) << path;
+    EXPECT_TRUE(pr.trailer_ok) << path;
+    EXPECT_TRUE(pr.read_to_eof) << path;
+    EXPECT_GT(pr.audio_packets, 0) << path;
+    // Timestamps restart near zero in every segment.
+    EXPECT_LT(pr.first_video_pts_ms, 100) << path;
+    total += pr.video_packets;
+  }
+  EXPECT_EQ(total, 90);
+  EXPECT_FALSE(fs::exists(f.dir / "seg_003.mp4"));
+  {
+    std::lock_guard lock(seg_mutex);
+    EXPECT_EQ(segment_paths.size(), 2U);  // two rotations after the first file
+  }
   EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
 }
 

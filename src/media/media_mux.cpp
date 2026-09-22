@@ -15,14 +15,30 @@ constexpr std::size_t kMaxPendingBeforeHeader = 256;
 // before that are held, bounded). FLUSH (drain removal / stop) writes the
 // trailer; a fast Close still tries to finish the file so FLV
 // previousTagSize / MP4 moov are complete whenever possible (03 TR-D-6).
+//
+// Segmented output (long-video splitting): with |output_pattern|
+// ("dir/out_%03d.mp4") instead of |output_path|, every video packet flagged
+// GE_PACKET_FLAG_SEGMENT_START (VideoEncode's segment_duration_ms) rotates
+// the file: trailer + close, open the next path, re-create the streams from
+// the recorded codecpar, write the header right away. Timestamps restart at
+// zero in each segment so every file is independently playable; a
+// "media_segment" event {index, path, start_pts_ns} announces each rotation.
 class MediaMux final : public Operator {
  public:
   explicit MediaMux(JsonValue options) : options_(std::move(options)) {}
 
   Status Open(const OpenRequest& r) override {
     ctx_.Capture(r);
-    output_path_ = options_.GetString("output_path").value_or("");
-    if (output_path_.empty()) return Status::InvalidArgument(ctx_.Prefix() + "output_path is required");
+    output_pattern_ = options_.GetString("output_pattern").value_or("");
+    if (!output_pattern_.empty()) {
+      if (output_pattern_.find('%') == std::string::npos) {
+        return Status::InvalidArgument(ctx_.Prefix() + "output_pattern needs a printf-style index (e.g. out_%03d.mp4)");
+      }
+      output_path_ = PathFor(0);
+    } else {
+      output_path_ = options_.GetString("output_path").value_or("");
+    }
+    if (output_path_.empty()) return Status::InvalidArgument(ctx_.Prefix() + "output_path or output_pattern is required");
     container_ = options_.GetString("container").value_or("");
     if (container_.empty()) {
       const std::string ext = std::filesystem::path(output_path_).extension().string();
@@ -57,7 +73,14 @@ class MediaMux final : public Operator {
       Stream& st = port == "audio" ? audio_ : video_;
       if (st.index < 0) {
         if (Status s = AddStream(st, *in, port); !s.ok()) return s;
-        if (port == "video") first_video_pts_ns_ = in->header.pts_ns;
+        if (port == "video") {
+          first_video_pts_ns_ = in->header.pts_ns;
+          if (!output_pattern_.empty()) segment_start_pts_ns_ = in->header.pts_ns;
+        }
+      }
+      if (!output_pattern_.empty() && port == "video" && header_written_ &&
+          (in->header.flags & GE_PACKET_FLAG_SEGMENT_START) != 0) {
+        if (Status s = Rotate(*in, req.events); !s.ok()) return s;
       }
       if (!header_written_) {
         pending_.emplace_back(port == "audio", in);
@@ -96,6 +119,7 @@ class MediaMux final : public Operator {
   Status AddStream(Stream& st, const Packet& first, std::string_view port) {
     const std::string* json = CodecParJson(first);
     if (json == nullptr) return Status::InvalidArgument(ctx_.Prefix() + "first '" + std::string(port) + "' packet carries no codecpar");
+    (port == "audio" ? audio_codecpar_json_ : video_codecpar_json_) = *json;
     JsonParseResult parsed = ParseJson(*json);
     if (!parsed.ok()) return Status::InvalidArgument(ctx_.Prefix() + "codecpar: " + parsed.error);
     AVStream* s = avformat_new_stream(fmt_.get(), nullptr);
@@ -156,8 +180,16 @@ class MediaMux final : public Operator {
     if (const int err = av_packet_ref(pkt.get(), src); err < 0) return ff::ToStatus(err, ctx_.Prefix() + "packet_ref");
     AVStream* s = fmt_->streams[st.index];
     pkt->stream_index = st.index;
-    pkt->pts = ff::FromNs(in.header.pts_ns, s->time_base);
-    pkt->dts = ff::FromNs(in.header.dts_ns == INT64_MIN ? in.header.pts_ns : in.header.dts_ns, s->time_base);
+    // Segmented files restart at zero so each is independently playable.
+    const std::int64_t base = output_pattern_.empty() || segment_start_pts_ns_ == INT64_MIN ? 0 : segment_start_pts_ns_;
+    pkt->pts = ff::FromNs(in.header.pts_ns - base, s->time_base);
+    pkt->dts = ff::FromNs((in.header.dts_ns == INT64_MIN ? in.header.pts_ns : in.header.dts_ns) - base, s->time_base);
+    if (base > 0) {
+      // A packet straddling the split (audio frame, B-free video never
+      // does) is clamped rather than written with a negative timestamp.
+      if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < 0) pkt->pts = 0;
+      if (pkt->dts != AV_NOPTS_VALUE && pkt->dts < 0) pkt->dts = 0;
+    }
     if (pkt->dts != AV_NOPTS_VALUE && st.last_dts != INT64_MIN && pkt->dts <= st.last_dts) pkt->dts = st.last_dts + 1;
     if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE && pkt->pts < pkt->dts) pkt->pts = pkt->dts;
     st.last_dts = pkt->dts;
@@ -167,6 +199,60 @@ class MediaMux final : public Operator {
       return ff::ToStatus(err, ctx_.Prefix() + "write_frame");
     }
     ++st.packets;
+    return Status::Ok();
+  }
+
+  [[nodiscard]] std::string PathFor(int index) const {
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf), output_pattern_.c_str(), index);
+    return std::string(buf);
+  }
+
+  Status Rotate(const Packet& split, EventSink* events) {
+    if (Result<ProcessResult> r = Finish(); !r.ok()) return r.status();
+    ++segment_index_;
+    output_path_ = PathFor(segment_index_);
+    AVFormatContext* raw = nullptr;
+    const int err = avformat_alloc_output_context2(&raw, nullptr, container_.c_str(), output_path_.c_str());
+    if (err < 0 || raw == nullptr) {
+      return ff::ToStatus(err < 0 ? err : AVERROR_MUXER_NOT_FOUND, ctx_.Prefix() + "segment output context");
+    }
+    fmt_.reset(raw);
+    header_written_ = false;
+    trailer_written_ = false;
+    const auto reopen = [&](Stream& st, const std::string& codecpar_json) -> Status {
+      if (st.index < 0 || codecpar_json.empty()) return Status::Ok();
+      JsonParseResult parsed = ParseJson(codecpar_json);
+      if (!parsed.ok()) return Status::Internal(ctx_.Prefix() + "recorded codecpar: " + parsed.error);
+      AVStream* s = avformat_new_stream(fmt_.get(), nullptr);
+      if (s == nullptr) return Status::ResourceExhausted(ctx_.Prefix() + "new stream");
+      if (Status r = CodecParFromJson(*parsed.value, s->codecpar); !r.ok()) return r;
+      s->codecpar->codec_tag = 0;
+      s->time_base = st.time_base;
+      st.index = s->index;
+      st.last_dts = INT64_MIN;
+      st.packets = 0;
+      return Status::Ok();
+    };
+    // Streams are re-created in the original order so indices are stable.
+    if (video_.index >= 0 && audio_.index >= 0 && audio_.index < video_.index) {
+      if (Status s = reopen(audio_, audio_codecpar_json_); !s.ok()) return s;
+      if (Status s = reopen(video_, video_codecpar_json_); !s.ok()) return s;
+    } else {
+      if (Status s = reopen(video_, video_codecpar_json_); !s.ok()) return s;
+      if (Status s = reopen(audio_, audio_codecpar_json_); !s.ok()) return s;
+    }
+    segment_start_pts_ns_ = split.header.pts_ns;
+    // The new segment starts at the split IDR: leading audio is trimmed
+    // against it (align_start), same as a rendition that starts mid-stream.
+    first_video_pts_ns_ = split.header.pts_ns;
+    if (Status s = WriteHeader(false); !s.ok()) return s;
+    if (events != nullptr) {
+      events->Publish(kEventMediaSegment, Severity::kInfo,
+                      JsonValue(JsonObject{{"index", JsonValue(segment_index_)},
+                                           {"path", JsonValue(output_path_)},
+                                           {"start_pts_ns", JsonValue(split.header.pts_ns)}}));
+    }
     return Status::Ok();
   }
 
@@ -180,7 +266,10 @@ class MediaMux final : public Operator {
 
   JsonValue options_;
   NodeContext ctx_;
-  std::string output_path_, container_, movflags_;
+  std::string output_path_, output_pattern_, container_, movflags_;
+  std::string video_codecpar_json_, audio_codecpar_json_;
+  int segment_index_ = 0;
+  std::int64_t segment_start_pts_ns_ = INT64_MIN;
   bool video_connected_ = false, audio_connected_ = false, align_start_ = true;
   std::int64_t first_video_pts_ns_ = INT64_MIN;
   std::int64_t trimmed_audio_ = 0;

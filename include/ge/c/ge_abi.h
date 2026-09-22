@@ -96,6 +96,9 @@ typedef struct ge_buffer_view {
 #define GE_PACKET_FLAG_EOS 0x2u
 #define GE_PACKET_FLAG_EVENT 0x4u
 #define GE_PACKET_FLAG_DROPPED 0x8u
+/* Tail-appended (13 §3.1): first packet of a new output segment (a keyframe;
+ * segmented encoders set it, segmenting muxers rotate their file on it). */
+#define GE_PACKET_FLAG_SEGMENT_START 0x10u
 
 typedef struct ge_packet_view {
   ge_struct_header header;

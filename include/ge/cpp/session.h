@@ -62,6 +62,11 @@ struct SessionOptions {
   // json, custom tags without queue.max_packet_bytes) is rejected at
   // admission instead of merely being left out of the budget.
   bool reject_unbudgeted_edges = false;
+  // GM-3: validation/negotiation result of the spec's skeleton, produced by
+  // GraphTemplate::Prevalidate. When set, Session::Create skips A4/A5 (the
+  // caller guarantees the spec differs from the validated skeleton only in
+  // node options, which validation does not read). A6 still runs.
+  std::shared_ptr<const ValidatedGraph> prevalidated;
 };
 
 struct SessionEvents {

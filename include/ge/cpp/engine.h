@@ -18,6 +18,7 @@
 #include <ge/cpp/audit_log.h>
 #include <ge/cpp/event_bus.h>
 #include <ge/cpp/graph_spec.h>
+#include <ge/cpp/graph_template.h>
 #include <ge/cpp/operation.h>
 #include <ge/cpp/packet.h>
 #include <ge/cpp/plugin_registry.h>
@@ -112,6 +113,14 @@ class Engine final {
   // Sessions (12 §12.4 SessionManager).
   [[nodiscard]] Result<Session*> CreateSession(const GraphSpec& spec, CallerContext caller = {},
                                                OperationId* out_operation = nullptr);
+  // GM-3 batch reuse: validates |tmpl|'s skeleton against this engine's
+  // operators once (idempotent; call again after LoadPlugin/UpgradeOperator
+  // changed the operator set). Instances created through the overload below
+  // skip validation/negotiation and only run per-instance admission.
+  [[nodiscard]] Status PrevalidateTemplate(GraphTemplate& tmpl);
+  [[nodiscard]] Result<Session*> CreateSession(const GraphTemplate& tmpl, const JsonValue& arguments,
+                                               std::string_view instance_name = {}, CallerContext caller = {},
+                                               OperationId* out_operation = nullptr);
   [[nodiscard]] Session* FindSession(SessionId id) const;
   // Stops (fast) if needed, waits for closure, then frees the session.
   [[nodiscard]] Status DestroySession(SessionId id);
@@ -143,6 +152,9 @@ class Engine final {
 
  private:
   explicit Engine(EngineConfig config);
+  [[nodiscard]] Result<Session*> CreateSession(const GraphSpec& spec, CallerContext caller,
+                                               OperationId* out_operation,
+                                               std::shared_ptr<const ValidatedGraph> prevalidated);
   void WatchdogLoop();
   void PublishSessionEvent(SessionId session, std::string type, Severity severity, NodeId node,
                            JsonValue detail);

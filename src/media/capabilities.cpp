@@ -69,7 +69,8 @@ CapabilityDescriptor MediaDemuxCapability() {
   d.outputs = {Port("video", PortDirection::kOutput, kTagEncodedVideo, true, PortCardinality::kMulti),
                Port("audio", PortDirection::kOutput, kTagEncodedAudio, true, PortCardinality::kMulti)};
   for (PortCapability& p : d.outputs) p.dynamic_consumers = true;
-  d.parameters.schema = Schema({{"input_path", "string"}, {"realtime", "boolean"}, {"loop", "boolean"}});
+  d.parameters.schema = Schema({{"input_path", "string"}, {"realtime", "boolean"}, {"loop", "boolean"},
+                                {"start_ms", "integer"}, {"end_ms", "integer"}});
   return d;
 }
 
@@ -131,7 +132,8 @@ CapabilityDescriptor VideoEncodeCapability() {
                                 {"gop", "integer"},
                                 {"fps", "integer"},
                                 {"preset", "string"},
-                                {"force_idr", "boolean"}});
+                                {"force_idr", "boolean"},
+                                {"segment_duration_ms", "integer"}});
   d.events.emits = {std::string(kEventMediaFormatChanged)};
   return d;
 }
@@ -151,7 +153,9 @@ CapabilityDescriptor MediaMuxCapability() {
   d.inputs = {Port("video", PortDirection::kInput, kTagEncodedVideo, true),
               Port("audio", PortDirection::kInput, kTagEncodedAudio, false)};
   for (PortCapability& p : d.inputs) p.sync = std::vector<SyncPolicy>{SyncPolicy::kAny};
-  d.parameters.schema = Schema({{"output_path", "string"}, {"container", "string"}, {"movflags", "string"}, {"align_start", "boolean"}});
+  d.parameters.schema = Schema({{"output_path", "string"}, {"output_pattern", "string"}, {"container", "string"},
+                                {"movflags", "string"}, {"align_start", "boolean"}});
+  d.events.emits = {std::string(kEventMediaSegment)};
   return d;
 }
 

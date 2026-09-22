@@ -465,10 +465,14 @@ Result<std::unique_ptr<Session>> Session::Create(const GraphSpec& spec, Operator
                                                  ExecutorPool& executor,
                                                  OperationRegistry& operations,
                                                  SessionOptions options, SessionEvents events) {
-  // A4–A5 once here; Build reuses the result.
-  GraphValidator validator([&factory](const OperatorKey& k) { return factory.Describe(k); });
-  auto validated = validator.Validate(spec);
-  if (!validated.ok()) return validated.status();
+  // A4–A5 once here (or once per template, GM-3); Build reuses the result.
+  std::shared_ptr<const ValidatedGraph> validated = options.prevalidated;
+  if (validated == nullptr) {
+    GraphValidator validator([&factory](const OperatorKey& k) { return factory.Describe(k); });
+    auto own = validator.Validate(spec);
+    if (!own.ok()) return own.status();
+    validated = std::make_shared<const ValidatedGraph>(std::move(*own));
+  }
   // A6 for the initial graph (12 §10.2): estimate -> reserve, before any
   // operator instance exists, let alone opens.
   ResourceLease lease;
@@ -484,7 +488,7 @@ Result<std::unique_ptr<Session>> Session::Create(const GraphSpec& spec, Operator
   bo.session_id = options.id;
   bo.version = 1;
   bo.aligned = options.aligned;
-  bo.validated = &*validated;
+  bo.validated = validated.get();
   auto topo = RuntimeTopology::Build(spec, factory, bo);
   if (!topo.ok()) return topo.status();
   std::unique_ptr<Session> s(new Session(std::move(*topo), factory, executor, operations,

@@ -21,6 +21,14 @@ class MediaDemux final : public Operator {
     if (!path || path->empty()) return Status::InvalidArgument(ctx_.Prefix() + "input_path is required");
     realtime_ = r.options->GetBool("realtime").value_or(false);
     loop_ = r.options->GetBool("loop").value_or(false);
+    start_ms_ = r.options->GetInteger("start_ms").value_or(0);
+    end_ms_ = r.options->GetInteger("end_ms").value_or(0);
+    if (start_ms_ < 0 || end_ms_ < 0 || (end_ms_ > 0 && end_ms_ <= start_ms_)) {
+      return Status::InvalidArgument(ctx_.Prefix() + "invalid start_ms/end_ms range");
+    }
+    if ((start_ms_ > 0 || end_ms_ > 0) && loop_) {
+      return Status::InvalidArgument(ctx_.Prefix() + "start_ms/end_ms cannot be combined with loop");
+    }
 
     AVFormatContext* raw = nullptr;
     if (const int err = avformat_open_input(&raw, path->c_str(), nullptr, nullptr); err < 0) {
@@ -48,6 +56,14 @@ class MediaDemux final : public Operator {
       audio_format_ = FormatOfCodecPar(*st->codecpar, st->time_base);
       audio_codecpar_ = CodecParToJson(*st->codecpar);
     }
+    if (start_ms_ > 0) {
+      // Land on the keyframe at or before start so the slice decodes from
+      // its first packet; the encoder downstream re-times from the packet
+      // timestamps, which stay on the source clock.
+      if (const int err = av_seek_frame(fmt_.get(), -1, start_ms_ * 1000, AVSEEK_FLAG_BACKWARD); err < 0) {
+        return ff::ToStatus(err, ctx_.Prefix() + "seek to " + std::to_string(start_ms_) + "ms");
+      }
+    }
     start_wall_ = std::chrono::steady_clock::now();
     return Status::Ok();
   }
@@ -71,6 +87,12 @@ class MediaDemux final : public Operator {
       const std::int64_t dts_ns = ff::ToNs(pkt->dts, st->time_base) + loop_offset_ns_;
       if (loop_ && pkt->pts != AV_NOPTS_VALUE) {
         last_pts_ns_ = std::max(last_pts_ns_, pts_ns + ff::ToNs(pkt->duration, st->time_base));
+      }
+      // End of the requested slice: EOS once the video passed |end_ms_|
+      // (audio follows the video cut; a pure-audio graph cuts on audio).
+      if (end_ms_ > 0 && pts_ns != INT64_MIN && pts_ns >= end_ms_ * 1000000 &&
+          (is_video || video_index_ < 0 || !video_connected_)) {
+        return ProcessResult::kExhausted;
       }
       if (realtime_) Pace(is_video ? dts_ns : pts_ns);
       std::uint32_t flags = 0;
@@ -117,6 +139,7 @@ class MediaDemux final : public Operator {
   int video_index_ = -1, audio_index_ = -1;
   bool video_connected_ = false, audio_connected_ = false;
   bool realtime_ = false, loop_ = false;
+  std::int64_t start_ms_ = 0, end_ms_ = 0;
   MediaFormat video_format_, audio_format_;
   JsonValue video_codecpar_ = JsonValue(JsonObject{}), audio_codecpar_ = JsonValue(JsonObject{});
   PacketSeq video_seq_ = 0, audio_seq_ = 0;

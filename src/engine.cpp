@@ -564,6 +564,11 @@ Result<UpgradeReport> Engine::UpgradeOperator(const OperatorKey& old_key, const 
 
 Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext caller,
                                        OperationId* out_operation) {
+  return CreateSession(spec, std::move(caller), out_operation, nullptr);
+}
+
+Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext caller, OperationId* out_operation,
+                                       std::shared_ptr<const ValidatedGraph> prevalidated) {
   std::lock_guard lock(sessions_mutex_);
   const SessionId sid = next_session_id_++;
   // The full spec is the digest (node options may carry URLs / credentials:
@@ -580,6 +585,7 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
   so.async_runtime = async_.get();
   so.resource_ledger = ledger_.get();
   so.reject_unbudgeted_edges = config_.reject_unbudgeted_edges;
+  so.prevalidated = std::move(prevalidated);
   if (const auto b = spec.options().extra.GetBool("batching")) so.batching = *b;
   SessionEvents ev;
   ev.on_state_changed = [this, sid](SessionState from, SessionState to) {
@@ -634,6 +640,18 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
   sessions_[sid] = std::shared_ptr<Session>(std::move(*r));
   operations_.Succeed(op, raw->topology_version());
   return raw;
+}
+
+Status Engine::PrevalidateTemplate(GraphTemplate& tmpl) {
+  return tmpl.Prevalidate([this](const OperatorKey& k) { return factory_.Describe(k); });
+}
+
+Result<Session*> Engine::CreateSession(const GraphTemplate& tmpl, const JsonValue& arguments,
+                                       std::string_view instance_name, CallerContext caller,
+                                       OperationId* out_operation) {
+  Result<GraphSpec> spec = tmpl.Instantiate(arguments, instance_name);
+  if (!spec.ok()) return spec.status();
+  return CreateSession(*spec, std::move(caller), out_operation, tmpl.validated());
 }
 
 Session* Engine::FindSession(SessionId id) const {
