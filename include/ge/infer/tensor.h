@@ -1,7 +1,6 @@
 #ifndef GE_INFER_TENSOR_H_
 #define GE_INFER_TENSOR_H_
 
-// Tensor packet convention for ge_infer (12 §2.2 "Tensor" builtin tag).
 //
 // payload: dense, row-major, host memory (MemoryKind::kHost), no padding.
 // metadata[kFormat] = JSON {"dtype": "float32"|"uint8"|"int64", "shape": [d0, d1, ...]}

@@ -7,6 +7,10 @@ namespace ge::media {
 
 namespace {
 
+// Compose/AudioMix expose one input port per member slot: "main" plus
+// "s1".."s16" (docs/04 MX-I-7 caps the scene at 16 members).
+constexpr int kMaxComposeMembers = 16;
+
 PortCapability Port(std::string_view name, PortDirection dir, std::string_view tag, bool required = true,
                     PortCardinality card = PortCardinality::kSingle) {
   PortCapability p;
@@ -159,6 +163,57 @@ CapabilityDescriptor MediaMuxCapability() {
   return d;
 }
 
+CapabilityDescriptor VideoComposeCapability() {
+  CapabilityDescriptor d = Base(kOpVideoCompose, "N-way video composition (grid/PiP layout, timestamp alignment)");
+  PortCapability main = VideoPort("main", PortDirection::kInput, DecodedPixelFormats());
+  main.sync = std::vector<SyncPolicy>{SyncPolicy::kAligned};
+  d.inputs.push_back(std::move(main));
+  for (int i = 1; i <= kMaxComposeMembers; ++i) {
+    PortCapability p = VideoPort("s" + std::to_string(i), PortDirection::kInput, DecodedPixelFormats());
+    p.required = false;
+    p.sync = std::vector<SyncPolicy>{SyncPolicy::kAligned};
+    d.inputs.push_back(std::move(p));
+  }
+  d.outputs = {VideoPort("out", PortDirection::kOutput, EncoderPixelFormats(), PortCardinality::kMulti)};
+  d.parameters.hot_updatable = {"slots", "gap", "background", "window_ms", "on_missing", "freeze_upgrade_ms", "reference",
+                                "drop_late"};
+  d.parameters.schema = JsonValue(JsonObject{
+      {"type", JsonValue("object")},
+      {"properties", JsonValue(JsonObject{{"width", JsonValue(JsonObject{{"type", JsonValue("integer")}})},
+                                          {"height", JsonValue(JsonObject{{"type", JsonValue("integer")}})},
+                                          {"fps", JsonValue(JsonObject{{"type", JsonValue("integer")}})},
+                                          {"gap", JsonValue(JsonObject{{"type", JsonValue("integer")}})},
+                                          {"background", JsonValue(JsonObject{{"type", JsonValue("string")}})},
+                                          {"slots", JsonValue(JsonObject{{"type", JsonValue("array")}})},
+                                          {"window_ms", JsonValue(JsonObject{{"type", JsonValue("integer")}})},
+                                          {"queue_ms", JsonValue(JsonObject{{"type", JsonValue("integer")}})},
+                                          {"reference", JsonValue(JsonObject{{"type", JsonValue("string")}})},
+                                          {"on_missing", JsonValue(JsonObject{{"type", JsonValue("string")}})},
+                                          {"freeze_upgrade_ms", JsonValue(JsonObject{{"type", JsonValue("integer")}})},
+                                          {"drop_late", JsonValue(JsonObject{{"type", JsonValue("boolean")}})}})} ,
+      {"required", JsonValue(JsonArray{JsonValue("width"), JsonValue("height"), JsonValue("slots")})}});
+  return d;
+}
+
+CapabilityDescriptor AudioMixCapability() {
+  CapabilityDescriptor d = Base(kOpAudioMix, "N-way audio mixing (per-member gain/mute)");
+  PortCapability main = AudioPort("main", PortDirection::kInput, {"fltp", "s16", "flt", "s16p"});
+  main.sync = std::vector<SyncPolicy>{SyncPolicy::kAligned};
+  d.inputs.push_back(std::move(main));
+  for (int i = 1; i <= kMaxComposeMembers; ++i) {
+    PortCapability p = AudioPort("s" + std::to_string(i), PortDirection::kInput, {"fltp", "s16", "flt", "s16p"});
+    p.required = false;
+    p.sync = std::vector<SyncPolicy>{SyncPolicy::kAligned};
+    d.inputs.push_back(std::move(p));
+  }
+  // The mix loop accumulates interleaved s16 (Store/ReadInterleaved), so
+  // that is the only format the node emits; the encoder resamples from it.
+  d.outputs = {AudioPort("out", PortDirection::kOutput, {"s16"}, PortCardinality::kMulti)};
+  d.parameters.hot_updatable = {"gains", "frame_size"};
+  d.parameters.schema = Schema({{"gains", "array"}, {"frame_size", "integer"}});
+  return d;
+}
+
 void RegisterMediaOperators(BuiltinOperatorFactory& factory) {
   factory.Register(MediaDemuxCapability(), &MakeMediaDemux);
   factory.Register(VideoDecodeCapability(), &MakeVideoDecode);
@@ -169,6 +224,8 @@ void RegisterMediaOperators(BuiltinOperatorFactory& factory) {
   factory.Register(VideoEncodeCapability(), &MakeVideoEncode);
   factory.Register(AudioEncodeCapability(), &MakeAudioEncode);
   factory.Register(MediaMuxCapability(), &MakeMediaMux);
+  factory.Register(VideoComposeCapability(), &MakeVideoCompose);
+  factory.Register(AudioMixCapability(), &MakeAudioMix);
 }
 
 std::shared_ptr<BuiltinOperatorFactory> MakeMediaOperatorFactory() {

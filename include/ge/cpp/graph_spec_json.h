@@ -10,9 +10,7 @@
 
 namespace ge {
 
-// GraphSpecParser (13 §7.1): JSON <-> GraphSpec / MutationPatch.
 //
-// Parsing enforces the document header rules of 14 §1.1 and 13 §10:
 //  * kind / schema_version are mandatory; $id major must match;
 //  * unknown fields are rejected unless the top level sets
 //    allow_unknown_fields=true.

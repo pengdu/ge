@@ -1,0 +1,26 @@
+set (install_prefix "@CMAKE_CURRENT_BINARY_DIR@/install-consumer-prefix")
+set (consumer_build "@CMAKE_CURRENT_BINARY_DIR@/install-consumer-build")
+set (fixture "@CMAKE_CURRENT_SOURCE_DIR@/tests/install_consumer")
+
+file (REMOVE_RECURSE "${install_prefix}" "${consumer_build}")
+
+execute_process (
+  COMMAND "@CMAKE_COMMAND@" --install "@CMAKE_CURRENT_BINARY_DIR@" --prefix "${install_prefix}"
+  RESULT_VARIABLE install_rc)
+if (NOT install_rc EQUAL 0)
+  message (FATAL_ERROR "install consumer fixture: install failed (${install_rc})")
+endif ()
+
+execute_process (
+  COMMAND "@CMAKE_COMMAND@" -S "${fixture}" -B "${consumer_build}" -DCMAKE_PREFIX_PATH=${install_prefix}
+  RESULT_VARIABLE configure_rc)
+if (NOT configure_rc EQUAL 0)
+  message (FATAL_ERROR "install consumer fixture: find_package configuration failed (${configure_rc})")
+endif ()
+
+execute_process (
+  COMMAND "@CMAKE_COMMAND@" --build "${consumer_build}" --target ge_install_plugin ge_install_cpp_consumer
+  RESULT_VARIABLE build_rc)
+if (NOT build_rc EQUAL 0)
+  message (FATAL_ERROR "install consumer fixture: consumer build failed (${build_rc})")
+endif ()

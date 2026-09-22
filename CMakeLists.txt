@@ -5,6 +5,12 @@ project (
   VERSION 0.1.0
   LANGUAGES C CXX)
 
+set (GE_PACKAGE_NAME "ge")
+set (GE_PACKAGE_DESCRIPTION "Graph execution engine")
+set (GE_MEDIA_PACKAGE_NAME "ge-media")
+set (GE_MEDIA_PACKAGE_DESCRIPTION "FFmpeg media operators for the graph execution engine")
+set (GE_PACKAGE_PC_PREFIX "\${pcfiledir}/../..")
+
 set (CMAKE_C_STANDARD 11)
 set (CMAKE_C_STANDARD_REQUIRED ON)
 set (CMAKE_C_EXTENSIONS OFF)
@@ -19,7 +25,7 @@ set (CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 option (GE_ENABLE_SANITIZERS "Build with ASan/UBSan" OFF)
 option (GE_ENABLE_TSAN "Build with ThreadSanitizer (exclusive with ASan)" OFF)
 option (GE_BUILD_SAMPLES "Build FFmpeg samples (requires FFmpeg)" ON)
-option (GE_ENABLE_MEDIA "Build ge_media (FFmpeg based media operators, P6)" ON)
+option (GE_ENABLE_MEDIA "Build FFmpeg media operators" ON)
 option (GE_ENABLE_ONNX "Build OnnxInfer in ge_infer (needs ONNX Runtime via pkg-config)" ON)
 
 # Build artifacts land in build/<platform>/<release|debug>/{lib,bin} so that several platforms and configurations can
@@ -48,6 +54,8 @@ if (NOT DEFINED GE_OUTPUT_SUFFIX)
 endif ()
 set (GE_OUTPUT_ROOT "${CMAKE_SOURCE_DIR}/build/${GE_PLATFORM}/$<LOWER_CASE:$<CONFIG>>${GE_OUTPUT_SUFFIX}")
 
+include (GNUInstallDirs)
+
 set (CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${GE_OUTPUT_ROOT}/lib")
 set (CMAKE_LIBRARY_OUTPUT_DIRECTORY "${GE_OUTPUT_ROOT}/lib")
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${GE_OUTPUT_ROOT}/bin")
@@ -55,16 +63,18 @@ set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${GE_OUTPUT_ROOT}/bin")
 # ---------------------------------------------------------------------------
 # Warning / sanitizer flags shared by every target.
 # ---------------------------------------------------------------------------
+# Everything is wrapped in $<BUILD_INTERFACE> so an installed/exported ge
+# never imposes -Werror or sanitizer flags on downstream projects.
 add_library (ge_build_flags INTERFACE)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  target_compile_options (ge_build_flags INTERFACE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion
-                                                   -Wsign-conversion $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>)
+  target_compile_options (
+    ge_build_flags INTERFACE "$<BUILD_INTERFACE:-Wall;-Wextra;-Wpedantic;-Werror;-Wshadow;-Wconversion;-Wsign-conversion;$<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>>")
   if (GE_ENABLE_SANITIZERS)
-    target_compile_options (ge_build_flags INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options (ge_build_flags INTERFACE -fsanitize=address,undefined)
+    target_compile_options (ge_build_flags INTERFACE "$<BUILD_INTERFACE:-fsanitize=address,undefined;-fno-omit-frame-pointer>")
+    target_link_options (ge_build_flags INTERFACE "$<BUILD_INTERFACE:-fsanitize=address,undefined>")
   elseif (GE_ENABLE_TSAN)
-    target_compile_options (ge_build_flags INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
-    target_link_options (ge_build_flags INTERFACE -fsanitize=thread)
+    target_compile_options (ge_build_flags INTERFACE "$<BUILD_INTERFACE:-fsanitize=thread;-fno-omit-frame-pointer>")
+    target_link_options (ge_build_flags INTERFACE "$<BUILD_INTERFACE:-fsanitize=thread>")
   endif ()
 endif ()
 
@@ -72,7 +82,8 @@ endif ()
 # Public headers (C ABI + C++ wrappers). Header-only consumers link this.
 # ---------------------------------------------------------------------------
 add_library (ge_headers INTERFACE)
-target_include_directories (ge_headers INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_include_directories (ge_headers INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                                                 $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries (ge_headers INTERFACE ge_build_flags)
 
 # ---------------------------------------------------------------------------
@@ -117,6 +128,7 @@ target_include_directories (
   ge_core
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+target_compile_features (ge_core PUBLIC cxx_std_20)
 target_link_libraries (ge_core PUBLIC ge_headers Threads::Threads ${CMAKE_DL_LIBS})
 
 # Shared host library exporting the C API (13 §5). Plugins never link it; they only include the headers.
@@ -169,7 +181,7 @@ if (GE_ENABLE_ONNX)
   target_compile_definitions (ge_infer PRIVATE GE_HAVE_ONNXRUNTIME=1)
   # ORT headers are not -Wpedantic/-Wconversion clean; treat them as system headers.
   target_include_directories (ge_infer SYSTEM PRIVATE ${ONNXRUNTIME_INCLUDE_DIRS})
-  target_link_libraries (ge_infer PRIVATE PkgConfig::ONNXRUNTIME)
+  target_link_libraries (ge_infer PUBLIC PkgConfig::ONNXRUNTIME)
 else ()
   target_compile_definitions (ge_infer PRIVATE GE_HAVE_ONNXRUNTIME=0)
 endif ()
@@ -209,6 +221,10 @@ if (GE_ENABLE_MEDIA)
     src/media/video_encode.cpp
     src/media/audio_encode.cpp
     src/media/media_mux.cpp
+    src/media/video_compose.cpp
+    src/media/audio_mix.cpp
+    src/media/mix.cpp
+    src/media/mix_controller.cpp
     src/media/rendition.cpp
     src/media/transcode_controller.cpp
     src/media/testing.cpp)
@@ -220,8 +236,7 @@ if (GE_ENABLE_MEDIA)
   target_include_directories (ge_media SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
   target_link_libraries (
     ge_media
-    PUBLIC ge_core
-    PRIVATE PkgConfig::FFMPEG)
+    PUBLIC ge_core PkgConfig::FFMPEG)
 endif ()
 
 # ---------------------------------------------------------------------------
@@ -230,6 +245,11 @@ endif ()
 include (CTest)
 if (BUILD_TESTING)
   add_subdirectory (tests)
+  configure_file (cmake/verify_install_consumer.cmake.in
+                  "${CMAKE_CURRENT_BINARY_DIR}/verify_install_consumer.cmake" @ONLY)
+  add_test (NAME ge_install_consumer
+            COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_BINARY_DIR}/verify_install_consumer.cmake")
+  set_tests_properties (ge_install_consumer PROPERTIES LABELS install TIMEOUT 300)
 endif ()
 
 # ---------------------------------------------------------------------------
@@ -245,4 +265,56 @@ if (GE_BUILD_SAMPLES
     AND GE_ENABLE_MEDIA
     AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/samples/CMakeLists.txt")
   add_subdirectory (samples)
+endif ()
+
+# ---------------------------------------------------------------------------
+# Install & export (13 §1: the public surface is include/ge/{c,cpp,media,infer}).
+#   find_package(ge CONFIG)  ->  ge::ge_core / ge::ge_infer / ge::ge_media / ge::ge_engine
+#   pkg-config               ->  ge.pc (core+infer), ge-media.pc (media, Requires: ge)
+# ---------------------------------------------------------------------------
+install (
+  DIRECTORY include/ge
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  FILES_MATCHING
+  PATTERN "*.h")
+
+set (GE_INSTALL_TARGETS ge_build_flags ge_headers ge_core ge_infer ge_engine)
+if (GE_ENABLE_MEDIA)
+  list (APPEND GE_INSTALL_TARGETS ge_media)
+endif ()
+install (
+  TARGETS ${GE_INSTALL_TARGETS}
+  EXPORT geTargets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install (
+  EXPORT geTargets
+  NAMESPACE ge::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ge)
+
+include (CMakePackageConfigHelpers)
+set (GE_CONFIG_HAS_MEDIA ${GE_ENABLE_MEDIA})
+set (GE_CONFIG_HAS_ONNX ${GE_ENABLE_ONNX})
+configure_package_config_file (cmake/geConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/geConfig.cmake"
+                               INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ge)
+write_basic_package_version_file ("${CMAKE_CURRENT_BINARY_DIR}/geConfigVersion.cmake" COMPATIBILITY SameMajorVersion)
+install (FILES "${CMAKE_CURRENT_BINARY_DIR}/geConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/geConfigVersion.cmake"
+         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ge)
+
+# pkg-config. Static libraries: the consumer link line carries the private
+# system deps; FFmpeg/ORT come in through Requires.private.
+set (GE_PC_CORE_REQUIRES_PRIVATE "")
+if (GE_ENABLE_ONNX)
+  set (GE_PC_CORE_REQUIRES_PRIVATE "libonnxruntime")
+endif ()
+set (GE_PC_DL "")
+if (CMAKE_DL_LIBS)
+  set (GE_PC_DL " -l${CMAKE_DL_LIBS}")
+endif ()
+configure_file (cmake/ge.pc.in "${CMAKE_CURRENT_BINARY_DIR}/${GE_PACKAGE_NAME}.pc" @ONLY)
+install (FILES "${CMAKE_CURRENT_BINARY_DIR}/${GE_PACKAGE_NAME}.pc" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+if (GE_ENABLE_MEDIA)
+  configure_file (cmake/ge-media.pc.in "${CMAKE_CURRENT_BINARY_DIR}/${GE_MEDIA_PACKAGE_NAME}.pc" @ONLY)
+  install (FILES "${CMAKE_CURRENT_BINARY_DIR}/${GE_MEDIA_PACKAGE_NAME}.pc" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif ()

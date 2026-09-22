@@ -1,7 +1,5 @@
 #ifndef GE_MEDIA_RENDITION_H_
 #define GE_MEDIA_RENDITION_H_
-
-// P6 task 3: rendition subgraph template (03 §4 "档位级": Scale -> Encode
 // -> Mux branch) and the mutation patches that add/remove/update one.
 //
 // Base graph (shared, never touched by rendition changes):
@@ -9,7 +7,6 @@
 // Rendition <id> (three nodes, four edges, two entry edges):
 //   vdec.out -> r.<id>.scale -> r.<id>.venc -> r.<id>.mux.video
 //   aenc.out ------------------------------> r.<id>.mux.audio
-// Filters (03 TR-U-6) are VideoFilter nodes r.<id>.f.<filter> spliced into
 // the scale -> venc path with InsertChain and taken out again with a
 // bypass RemoveChain, so the encoder and mux never reopen.
 
@@ -113,11 +110,9 @@ class RenditionTemplate final {
   [[nodiscard]] static NodeSpec EncodeNode(const RenditionSpec& spec);
   [[nodiscard]] static NodeSpec MuxNode(const RenditionSpec& spec);
 
-  // Filters (03 TR-U-6). The new filter goes right before the encoder,
   // i.e. it splits whatever edge currently feeds r.<id>.venc.in in
   // |current| (the session's live GraphSpec): the template's own
   // scale-venc edge at first, later the derived "<from>-><to>" edges
-  // InsertChain / bypass leave behind (14 §3.2).
   [[nodiscard]] static Status ValidateFilter(const FilterSpec& filter);
   [[nodiscard]] static NodeSpec FilterNode(std::string_view rendition_id, const FilterSpec& filter);
   [[nodiscard]] static Result<std::string> FilterEntryEdge(const GraphSpec& current, std::string_view rendition_id);

@@ -19,7 +19,6 @@
 
 namespace ge {
 
-// 12 §10.1 resource ledger (RES-1..4, TD-03).
 //
 // One ledger per Engine. Capacity is per (kind, device); reservations are
 // all-or-nothing under one lock; a Lease returns its amounts when destroyed
@@ -33,7 +32,7 @@ enum class ResourceKind : std::uint8_t {
   kCudaStreams,     // per device
   kNvdecSessions,   // per device
   kNvencSessions,   // per device
-  kEdgeBufferBytes  // bytes; 12 §10.3 queue budget
+  kEdgeBufferBytes  // bytes
 };
 inline constexpr std::size_t kResourceKindCount = 8;
 [[nodiscard]] std::string_view ToString(ResourceKind kind) noexcept;
@@ -90,7 +89,6 @@ class ResourceLease final {
   [[nodiscard]] const std::vector<ResourceAmount>& amounts() const noexcept { return amounts_; }
   // RES-4: after warm-up the node reports what it really took. The delta is
   // reserved (all-or-nothing) or returned; on failure the lease keeps its
-  // estimate and the caller decides (12 §10.1 "warm-up fails and rolls back").
   [[nodiscard]] Status Commit(std::vector<ResourceAmount> actual, std::string_view purpose = "warm-up commit");
   void Release() noexcept;
 
@@ -115,7 +113,6 @@ class ResourceLedger final {
   void SetCapacity(ResourceKind kind, std::int32_t device_id, std::uint64_t capacity);
   [[nodiscard]] std::optional<std::uint64_t> Capacity(ResourceKind kind, std::int32_t device_id) const;
 
-  // All-or-nothing (12 §10.1). On failure nothing is reserved and the
   // status is RESOURCE_EXHAUSTED with context_json listing every short
   // dimension: {kind, device_id, requested, reserved, capacity, available}
   // plus `retry_after_release: true` (RES-3).
@@ -157,12 +154,10 @@ class ResourceLedger final {
   std::size_t live_leases_ = 0;
 };
 
-// 12 §10.2 estimate aggregation for a candidate topology (or the subset of
 // it that is new versus a base). Node estimates come from
 // CapabilityDescriptor::resources.amounts (keys parsed by
 // ParseResourceKind; a numeric device_id suffix `@N` selects the device,
 // otherwise the descriptor's first `cuda` device or -1); edge budgets follow
-// 12 §10.3: capacity x max_packet_bytes, where max_packet_bytes is the
 // spec's explicit value or one derived from the contract's format
 // (video: w*h*bpp for the pixel format; tensor: prod(shape)*dtype size;
 // audio/bytes/json/custom: unknown). An edge with no derivable bound and no

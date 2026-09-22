@@ -1,0 +1,12 @@
+prefix=@GE_PACKAGE_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: @GE_PACKAGE_NAME@
+Description: @GE_PACKAGE_DESCRIPTION@
+Version: @PROJECT_VERSION@
+Requires.private: @GE_PC_CORE_REQUIRES_PRIVATE@
+Libs: -L${libdir} -lge_infer -lge_core
+Libs.private: -lpthread@GE_PC_DL@
+Cflags: -I${includedir}

@@ -1,8 +1,6 @@
 #ifndef GE_INFER_ONNX_H_
 #define GE_INFER_ONNX_H_
 
-// OnnxInfer@1.0.0: asynchronous ONNX Runtime inference operator (12 §3.5 /
-// §4.2, ASY-1..8). First real backend behind AsyncRuntime.
 //
 //   in(Tensor)  -> out(Tensor)
 //
@@ -23,7 +21,6 @@
 // gets its own CompletionEvent with the matching slice (ASY-6). A member
 // whose tensor shape does not match the batch leader is run on its own.
 // Close() waits for the worker to drain (so the CompletionSink outlives every
-// callback, per 13 §4.6); fast_shutdown drops queued requests with
 // CANCELLED completions instead of running them.
 //
 // The Tensor packet convention is in tensor.h.
@@ -41,7 +38,6 @@ inline constexpr std::string_view kOpOnnxInfer = "OnnxInfer@1.0.0";
 
 [[nodiscard]] CapabilityDescriptor OnnxInferCapability();
 [[nodiscard]] std::unique_ptr<Operator> MakeOnnxInfer(const OperatorCreateArgs& args);
-// TD-03 per-instance estimate (12 §10.2): cpu_threads = intra_threads x
 // workers; host_memory = 2 x model file size (weights + ORT arena) when the
 // file can be stat'ed, else the descriptor's static amount.
 [[nodiscard]] std::vector<ResourceAmount> EstimateOnnxInfer(const CapabilityDescriptor& cap,

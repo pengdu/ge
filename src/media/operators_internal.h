@@ -6,7 +6,7 @@
 
 #include <ge/cpp/capability.h>
 #include <ge/cpp/operator.h>
-#include <ge/media/device_buffer.h>
+#include "media/device_buffer.h"
 #include <ge/media/frame.h>
 #include <ge/media/operators.h>
 

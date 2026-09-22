@@ -17,18 +17,15 @@ namespace ge {
 
 class NodeRuntime;
 
-// 12 §2.4a
 enum class EdgeState : std::uint8_t { kActive, kBackpressured, kDraining, kRetired };
 [[nodiscard]] std::string_view ToString(EdgeState s) noexcept;
 
-// 12 §2.3
 struct EdgeConfig {
   std::uint32_t capacity = 64;
   DropPolicy policy = DropPolicy::kBlock;
   SyncPolicy sync_policy = SyncPolicy::kAny;
 };
 
-// 12 §6.2 per-edge counters. Relaxed atomics; readers snapshot.
 struct EdgeMetrics {
   std::atomic<std::uint32_t> queue_depth{0};
   std::atomic<std::uint32_t> max_depth{0};
@@ -53,7 +50,6 @@ enum class PushOutcome : std::uint8_t {
   kCancelled,              // draining/retired edge
 };
 
-// Bounded FIFO with one producer and one consumer (12 §2.3). The engine
 // guarantees that at most one thread produces (the upstream node's invoke)
 // and at most one consumes (the downstream node's invoke) at any time;
 // drop_oldest performs the pop on the producer side under a light lock that
@@ -83,17 +79,12 @@ class EdgeChannel final {
   }
   [[nodiscard]] std::shared_ptr<NodeRuntime> producer() const noexcept { return producer_.lock(); }
   [[nodiscard]] std::shared_ptr<NodeRuntime> consumer() const noexcept { return consumer_.lock(); }
-  // Topology retire: active/backpressured -> draining (12 §2.4a).
   void MarkDraining() noexcept;
   // Drain complete or fast clear: -> retired. Fast clears the queue and
-  // releases every PacketRef (12 §7.7).
   void MarkRetired(bool fast) noexcept;
 
-  // 12 §6.2. EOS packets bypass the drop policy and always take a slot when
   // one is free; when full they report kWouldBlock so the caller re-tries
-  // (12 §4.4 step 5, block semantics without sleeping).
   [[nodiscard]] PushOutcome Push(PacketRef packet);
-  // Engine-only (12 §7.7 Drain): appends an EOS marker to a draining edge so
   // the consumer learns that no producer will follow. Accepted even while
   // draining; kWouldBlock if the queue is full (caller retries).
   [[nodiscard]] PushOutcome InjectEos(PacketRef eos);
@@ -111,7 +102,6 @@ class EdgeChannel final {
   // Scheduler hook: after a Pop freed a slot, backpressured -> active.
   // Returns true if the transition happened (upstream should be re-marked).
   bool ClearBackpressure() noexcept;
-  // Scheduler hook (12 §6.2): producer observed a full block-policy queue
   // before pushing. active -> backpressured; returns true only if the queue
   // is still full afterwards (otherwise the transition is undone).
   bool MarkBackpressured() noexcept;

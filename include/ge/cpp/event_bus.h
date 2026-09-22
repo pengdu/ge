@@ -21,7 +21,6 @@
 
 namespace ge {
 
-// 12 §12.2 Event (observation kind only travels through the bus).
 enum class EventKind : std::uint8_t { kDataPlane, kObservation };
 
 struct Event {
@@ -39,7 +38,6 @@ struct Event {
   [[nodiscard]] JsonValue ToJson() const;
 };
 
-// 13 §5.4 ge_event_filter.filter_json: {"types":[...], "min_severity":"info",
 // "session_id": n}. Every field optional; empty == everything.
 struct EventFilter {
   std::set<std::string> types;
@@ -52,7 +50,6 @@ struct EventFilter {
 using EventHandler = std::function<void(const Event&)>;
 using SubscriptionId = std::uint64_t;
 
-// 12 §12.2 / 13 §5.4: per-subscription bounded queue; one serial task chain
 // per subscription (ObserverExecutorPool), subscriptions run in parallel.
 // Publish never blocks the data plane: a full queue drops and counts.
 struct EventBusOptions {

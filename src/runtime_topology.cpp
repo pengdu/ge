@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <set>
 
 namespace ge {
 
@@ -12,15 +13,17 @@ namespace {
 // ports still appear (never ready).
 std::vector<InputPortBinding> OrderedPorts(const NodeRuntime& node,
                                            std::vector<InputPortBinding> ports) {
-  for (const PortCapability& p : node.capability().inputs) {
-    const bool bound = std::any_of(ports.begin(), ports.end(),
-                                   [&](const InputPortBinding& b) { return b.port == p.name; });
-    if (!bound) ports.push_back({p.name, nullptr, p.required, {}});
+  const auto& ins = node.capability().inputs;
+  std::map<std::string_view, std::size_t> index;
+  for (std::size_t i = 0; i < ins.size(); ++i) index.emplace(ins[i].name, i);
+  std::set<std::string> bound;
+  for (const InputPortBinding& b : ports) bound.insert(b.port);
+  for (const PortCapability& p : ins) {
+    if (!bound.contains(p.name)) ports.push_back({p.name, nullptr, p.required, {}});
   }
   const auto idx = [&](const std::string& name) {
-    const auto& ins = node.capability().inputs;
-    return std::find_if(ins.begin(), ins.end(), [&](const auto& p) { return p.name == name; }) -
-           ins.begin();
+    const auto it = index.find(name);
+    return it == index.end() ? index.size() : it->second;
   };
   std::stable_sort(ports.begin(), ports.end(),
                    [&](const auto& a, const auto& b) { return idx(a.port) < idx(b.port); });
@@ -61,17 +64,24 @@ Result<std::shared_ptr<RuntimeTopology>> RuntimeTopology::Build(const GraphSpec&
     t->next_edge_id_ = options.base->next_edge_id_;
   }
 
-  // Nodes.
+  // Nodes. |node_by_id| / |base_*| indexes keep the loops below O(V + E)
+  // instead of a linear rescan per element (large graphs rebuild on every
+  // mutation, so Build() itself is a hot path).
+  std::map<NodeId, NodeRuntimeRef> node_by_id;
+  std::map<const NodeRuntime*, NodeRuntimeRef> base_node_refs;
+  std::map<std::string_view, EdgeChannelRef> base_edge_by_id;
+  if (options.base != nullptr) {
+    for (const NodeRuntimeRef& r : options.base->nodes_) base_node_refs.emplace(r.get(), r);
+    for (const EdgeChannelRef& r : options.base->edges_) base_edge_by_id.emplace(r->external_id(), r);
+  }
   for (const NodeSpec& n : spec.nodes()) {
     if (options.base != nullptr && options.reused_nodes.contains(n.id)) {
       NodeRuntime* base_node = options.base->FindNode(n.id);
       if (base_node == nullptr) return Status::Internal("reused node '" + n.id + "' missing in base");
-      NodeRuntimeRef ref;
-      for (const NodeRuntimeRef& r : options.base->nodes_) {
-        if (r.get() == base_node) ref = r;
-      }
+      const NodeRuntimeRef ref = base_node_refs.at(base_node);
       t->nodes_.push_back(ref);
       t->node_ids_[n.id] = ref->id();
+      node_by_id.emplace(ref->id(), ref);
       continue;
     }
     const CapabilityDescriptor* cap = factory.Describe(n.op);
@@ -83,6 +93,7 @@ Result<std::shared_ptr<RuntimeTopology>> RuntimeTopology::Build(const GraphSpec&
     auto node = std::make_shared<NodeRuntime>(t->next_node_id_, n.id, n.op, *cap,
                                               std::move(*op), n.options, n.parallelism);
     t->node_ids_[n.id] = t->next_node_id_;
+    node_by_id.emplace(t->next_node_id_, node);
     ++t->next_node_id_;
     t->new_nodes_.push_back(node);
     t->nodes_.push_back(std::move(node));
@@ -94,9 +105,7 @@ Result<std::shared_ptr<RuntimeTopology>> RuntimeTopology::Build(const GraphSpec&
     const ConnectionContract& contract = validated->edge_contracts.at(e.id);
     EdgeChannelRef edge;
     if (options.base != nullptr && options.reused_edges.contains(e.id)) {
-      for (const EdgeChannelRef& r : options.base->edges_) {
-        if (r->external_id() == e.id) edge = r;
-      }
+      if (const auto it = base_edge_by_id.find(e.id); it != base_edge_by_id.end()) edge = it->second;
       if (!edge) return Status::Internal("reused edge '" + e.id + "' missing in base");
       // The reuse decision is GraphDiff's (contract/endpoint/queue changes
       // classify the edge as recreated, so it is not in |reused_edges|).
@@ -112,15 +121,11 @@ Result<std::shared_ptr<RuntimeTopology>> RuntimeTopology::Build(const GraphSpec&
       cfg.policy = e.queue.policy;
       cfg.sync_policy = contract.sync_policy;
       edge = std::make_shared<EdgeChannel>(t->next_edge_id_++, e.id, contract, cfg, e.from, e.to);
-      NodeRuntimeRef p, c;
-      for (const NodeRuntimeRef& r : t->nodes_) {
-        if (r->id() == from) p = r;
-        if (r->id() == to) c = r;
-      }
-      edge->Bind(p, c);  // reused edges keep their (identical) binding
+      edge->Bind(node_by_id.at(from), node_by_id.at(to));  // reused edges keep their (identical) binding
       t->new_edges_.push_back(edge);
     }
     t->edges_.push_back(edge);
+    t->edge_by_ptr_.emplace(edge.get(), edge);
     t->routes_[PortId{from, e.from.port}].push_back(
         {edge, contract, TypeTagRegistry::Global().Intern(contract.logical_type)});
     const NodeRuntime* target = t->FindNode(to);
@@ -186,6 +191,11 @@ EdgeChannel* RuntimeTopology::FindEdge(std::string_view external_id) const noexc
     if (e->external_id() == external_id) return e.get();
   }
   return nullptr;
+}
+
+EdgeChannelRef RuntimeTopology::SharedEdgeFor(const EdgeChannel* edge) const noexcept {
+  const auto it = edge_by_ptr_.find(edge);
+  return it == edge_by_ptr_.end() ? nullptr : it->second;
 }
 
 const std::vector<RouteEntry>* RuntimeTopology::RoutesFor(NodeId node,

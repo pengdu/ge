@@ -16,9 +16,7 @@
 namespace ge {
 
 // ---------------------------------------------------------------------------
-// CapabilityDescriptor (02 §3.3, 12 §8.1, 14 §5).
 // Every port capability is normalised into the constraint dimensions of
-// 12 §8.1. Output ports *provide* sets/ranges; input ports *accept* them.
 // An absent dimension means "unconstrained".
 // ---------------------------------------------------------------------------
 
@@ -46,7 +44,6 @@ struct Range {
 using IntRange = Range<std::int64_t>;
 using RationalRange = Range<double>;
 
-// Ordered set: element order is the declaring port's preference (12 §8.1
 // "priority: ordered preference list"). Intersection preserves the order of
 // the *left* operand.
 using FormatSet = std::vector<std::string>;
@@ -111,7 +108,7 @@ struct ExecutionCapability {
 
 struct ParameterCapability {
   std::vector<std::string> hot_updatable;
-  std::vector<std::string> migratable;  // 12 §7.5 ReplaceNode migration
+  std::vector<std::string> migratable;  // ReplaceNode migration
   JsonValue schema = JsonValue(JsonObject{});
   friend bool operator==(const ParameterCapability&, const ParameterCapability&) = default;
 };
@@ -156,7 +153,6 @@ struct CapabilityDescriptor {
 };
 
 // ---------------------------------------------------------------------------
-// ConnectionContract (02 §3.3): the frozen result of a negotiation.
 // ---------------------------------------------------------------------------
 
 struct SelectedVideoFormat {
@@ -209,7 +205,6 @@ struct ConnectionContract {
 };
 
 // ---------------------------------------------------------------------------
-// Negotiation (12 §8.2–8.4).
 // ---------------------------------------------------------------------------
 
 struct PreferenceSet {
@@ -252,14 +247,12 @@ struct FanoutConsumer {
 
 class CapabilityNegotiator final {
  public:
-  // 12 §8.2. Deterministic: same inputs => byte-identical contract.
   [[nodiscard]] Result<ConnectionContract> NegotiateEdge(
       const OperatorKey& source_op, CapabilityVersion source_cap,
       const PortCapability& output, const OperatorKey& target_op,
       CapabilityVersion target_cap, const PortCapability& input,
       std::optional<SyncPolicy> edge_sync, const PreferenceSet& pref);
 
-  // 12 §8.3. Consumers are sorted by (node_id, port) before intersecting so
   // the result is independent of declaration order. If |existing| is set,
   // the new common contract must equal it (Mutation adding a consumer).
   [[nodiscard]] Result<ConnectionContract> NegotiateFanout(
@@ -268,7 +261,6 @@ class CapabilityNegotiator final {
       const PreferenceSet& pref,
       const ConnectionContract* existing = nullptr);
 
-  // 12 §8.4.
   void InvalidateOperator(const OperatorKey& op);
   void InvalidateAll();
   [[nodiscard]] std::size_t cache_size() const noexcept { return cache_.size(); }
@@ -288,7 +280,6 @@ class CapabilityNegotiator final {
   std::optional<CapabilityConflict> last_conflict_;
 };
 
-// Builtin type families (12 §8.2 type_compatible). Opaque business tags
 // match only by exact equality (CAP-7).
 [[nodiscard]] bool IsBuiltinTypeTag(std::string_view tag) noexcept;
 

@@ -19,7 +19,6 @@
 
 namespace ge {
 
-// 12 §2.5
 struct RouteEntry {
   EdgeChannelRef edge;
   ConnectionContract contract;  // == edge->contract(); copied for lock-free reads
@@ -34,12 +33,8 @@ struct PortId {
 
 using RouteTable = std::map<PortId, std::vector<RouteEntry>>;
 // A node's InputBinding is shared by every topology version the node lives
-// in (12 §2.5 "InputBindingTable 发布后不可变" applies to the table, the
-// binding itself is rebound atomically at publish, 12 §7.2 B1).
 using InputBindingTable = std::map<NodeId, std::shared_ptr<InputBinding>>;
 
-// Immutable after Build (12 §2.5). Owns nodes, edges, routes and bindings of
-// one topology version. Leases are added in P3/P8.
 class RuntimeTopology final {
  public:
   struct BuildOptions {
@@ -62,7 +57,6 @@ class RuntimeTopology final {
   [[nodiscard]] static Result<std::shared_ptr<RuntimeTopology>> Build(
       const GraphSpec& spec, OperatorFactory& factory, const BuildOptions& options);
 
-  // 12 §7.2 B1: rebinding of reused nodes whose input edges changed. Called
   // by the coordinator right before the version swap; idempotent.
   void ApplyRebinds();
   // Nodes created by this version (not carried over).
@@ -82,6 +76,9 @@ class RuntimeTopology final {
   [[nodiscard]] NodeRuntime* FindNode(NodeId id) const noexcept;
   [[nodiscard]] NodeRuntime* FindNode(std::string_view external_id) const noexcept;
   [[nodiscard]] EdgeChannel* FindEdge(std::string_view external_id) const noexcept;
+  // Shared ref of an edge belonging to this topology; null when it is not
+  // part of this version. O(log E) -- used by the scheduler's park path.
+  [[nodiscard]] EdgeChannelRef SharedEdgeFor(const EdgeChannel* edge) const noexcept;
   [[nodiscard]] const std::vector<RouteEntry>* RoutesFor(NodeId node, std::string_view port) const noexcept;
   [[nodiscard]] InputBinding* InputsFor(NodeId node) const noexcept;
   [[nodiscard]] std::shared_ptr<InputBinding> SharedInputsFor(NodeId node) const noexcept;
@@ -96,6 +93,7 @@ class RuntimeTopology final {
   GraphSpec spec_;
   std::vector<NodeRuntimeRef> nodes_;
   std::vector<EdgeChannelRef> edges_;
+  std::map<const EdgeChannel*, EdgeChannelRef> edge_by_ptr_;
   RouteTable routes_;
   InputBindingTable inputs_;
   std::vector<std::string> order_;
@@ -114,7 +112,6 @@ class RuntimeTopology final {
 };
 
 // ---------------------------------------------------------------------------
-// PacketRouter (12 §4.1 host.emit validation, §6.2 Emit).
 // ---------------------------------------------------------------------------
 
 struct EmitReport {
@@ -129,13 +126,10 @@ struct EmitReport {
   // the edges that already accepted it.
   PacketRef packet;
 };
-
-// OBS-1 end-to-end helpers (Packet::ingress_ns).
 [[nodiscard]] std::int64_t SteadyNowNs() noexcept;
 [[nodiscard]] std::int64_t OldestIngress(const std::vector<PacketRef>& inputs) noexcept;
 
 // Stateless: routes through the RouteTable of the topology snapshot the
-// node is bound to (12 §4.1 step 1; retired nodes keep Vn, 12 §7.7).
 class PacketRouter final {
  public:
   // Validates port ownership and type_tag against the contract, stamps
@@ -149,13 +143,11 @@ class PacketRouter final {
                                    EmitReport* report = nullptr);
 
   // EOS to every route of |port|; retries blocked edges by reporting them
-  // so the caller can re-drive (12 §4.4 step 5).
   [[nodiscard]] static Status EmitEos(const RuntimeTopology& topology, NodeRuntime& node,
                                       std::string_view output_port,
                                       ParameterVersion parameter_version,
                                       EmitReport* report = nullptr);
 
-  // Split form of Emit for callers that route per edge (12 §6.2 parking):
   // Prepare validates and stamps without pushing; PushOne pushes to a
   // single edge and accounts it in |report| exactly like Emit does.
   [[nodiscard]] static Result<PacketRef> Prepare(const RuntimeTopology& topology, NodeRuntime& node,

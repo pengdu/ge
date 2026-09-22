@@ -22,7 +22,6 @@
 #include <ge/cpp/runtime_topology.h>
 #include <ge/cpp/types.h>
 
-// C handle body behind ge_completion_sink_handle (13 §4.6). Lives inside the
 // engine's CompletionSink; the magic lets completion_push reject stale or
 // foreign handles without dereferencing them.
 struct ge_completion_sink_t {
@@ -35,7 +34,6 @@ namespace ge {
 class AsyncRuntime;
 
 // ---------------------------------------------------------------------------
-// Options (12 §4.3, ASY-6/7). Batching is decided per request from the
 // global switch, the session switch and the node's "batch" options:
 //   {"batch": {"enabled": bool, "max_batch": N, "timeout_ms": M}}
 // ---------------------------------------------------------------------------
@@ -64,7 +62,6 @@ struct NodeBatchConfig {
 struct AsyncSessionHooks {
   // Packets were pushed to downstream edges: wake the consumers.
   std::function<void(const EmitReport& report)> after_emit;
-  // async_pending of |node| dropped to zero (12 §4.3 step 6).
   std::function<void(NodeRuntime& node)> on_async_idle;
   // A completion carried an error or submit failed: the runtime already
   // marked the node failed.
@@ -72,7 +69,6 @@ struct AsyncSessionHooks {
 };
 
 // ---------------------------------------------------------------------------
-// CompletionQueue (12 §4.3): bounded multi-producer queue drained by the
 // AsyncRuntime consumer. Full => RESOURCE_EXHAUSTED and dropped_on_full++.
 // ---------------------------------------------------------------------------
 
@@ -122,7 +118,6 @@ class SessionCompletionSink final : public CompletionSink {
 };
 
 // ---------------------------------------------------------------------------
-// AsyncRuntime (12 §4.2–4.3, §6.4, 13 §7.2): the only component that turns
 // completion events into data-plane output. Owns the CompletionQueue, the
 // in-flight request table, per-(node, topology) ReorderBuffers and the
 // Batcher. Shared by every Session of an Engine so batches may span
@@ -152,7 +147,6 @@ class AsyncRuntime final {
     PacketSeq packet_seq = 0;
     std::int32_t device_id = -1;
   };
-  // Scheduler entry (12 §4.2). Registers the request, then either submits
   // right away (batching off / max_batch 1) or parks it in the Batcher.
   // The node's async_pending was already incremented by the caller; the
   // runtime decrements it when the result is delivered, dropped or the
@@ -166,7 +160,6 @@ class AsyncRuntime final {
   [[nodiscard]] CompletionQueue& queue() noexcept { return queue_; }
   [[nodiscard]] const AsyncOptions& options() const noexcept { return options_; }
 
-  // Observability (12 §12.1, 15 P5 task 7).
   [[nodiscard]] std::uint64_t in_flight() const noexcept {
     return in_flight_count_.load(std::memory_order_relaxed);
   }
@@ -205,7 +198,7 @@ class AsyncRuntime final {
     NodeRuntimeRef node;
     std::shared_ptr<const RuntimeTopology> topology_ref;
     PacketSeq seq = 0;
-    std::int64_t ingress_ns = 0;  // OBS-1: oldest input ingress, inherited by outputs
+    std::int64_t ingress_ns = 0;
     std::chrono::steady_clock::time_point enqueued;
     std::optional<std::chrono::steady_clock::time_point> submitted;  // set at flush
     std::chrono::steady_clock::time_point deadline;                  // valid once submitted
@@ -264,7 +257,6 @@ class AsyncRuntime final {
     std::deque<RequestId> order;
   };
 
-  // 12 §6.2 block semantics for async output: a delivered result whose
   // downstream edge was full is parked here (per blocked edge) and pushed
   // again on every consumer iteration. While a node has parked output its
   // reorder buffer does not advance, so edge order equals seq order.
@@ -309,7 +301,6 @@ class AsyncRuntime final {
   std::map<ReorderKey, ReorderBuffer> reorder_;
   std::map<ReorderKey, BlockedOutput> blocked_;
   std::map<BatchKey, std::vector<Pending>> batches_;
-  // Serialises plugin submit calls so batches never interleave (13 §4.6).
   std::mutex submit_mutex_;
   std::mutex pump_mutex_;
 

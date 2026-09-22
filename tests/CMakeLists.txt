@@ -154,6 +154,9 @@ if (GE_ENABLE_MEDIA)
   ge_add_unit_test (ge_media_transcode_test unit/media_transcode_test.cpp)
   target_link_libraries (ge_media_transcode_test PRIVATE ge_media)
   set_tests_properties (ge_media_transcode_test PROPERTIES LABELS media TIMEOUT 300)
+  ge_add_unit_test (ge_media_mix_test unit/media_mix_test.cpp)
+  target_link_libraries (ge_media_mix_test PRIVATE ge_media)
+  set_tests_properties (ge_media_mix_test PROPERTIES LABELS media TIMEOUT 300)
 endif ()
 
 # Contention stress (15 §12.1). Every binary below is run as GE_STRESS_PARALLEL concurrent copies, each repeating its

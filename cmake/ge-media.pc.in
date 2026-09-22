@@ -1,0 +1,12 @@
+prefix=@GE_PACKAGE_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: @GE_MEDIA_PACKAGE_NAME@
+Description: @GE_MEDIA_PACKAGE_DESCRIPTION@
+Version: @PROJECT_VERSION@
+Requires: @GE_PACKAGE_NAME@ = @PROJECT_VERSION@
+Requires.private: libavcodec libavformat libavutil libswscale libswresample libavfilter
+Libs: -L${libdir} -lge_media
+Cflags: -I${includedir}

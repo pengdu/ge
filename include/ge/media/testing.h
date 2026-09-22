@@ -1,7 +1,6 @@
 #ifndef GE_MEDIA_TESTING_H_
 #define GE_MEDIA_TESTING_H_
 
-// Test/tool support for P6 acceptance (15 §9): generate a synthetic input
 // file (testsrc2 + sine through libavfilter, encoded with the same encoder
 // VideoEncode would pick) and probe an output file through libavformat.
 

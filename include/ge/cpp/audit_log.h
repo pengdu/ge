@@ -15,7 +15,6 @@
 
 namespace ge {
 
-// 12 §12.3 audit (AUD-1/AUD-2).
 //
 // One AuditLog per Engine. Every control operation (session.create /
 // session.stop / mutation.apply / parameter.set / plugin.*) is appended once

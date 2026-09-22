@@ -11,8 +11,6 @@ namespace ge {
 
 class Engine;
 class Session;
-
-// OBS-1 / OBS-2 (12 §12.1): Prometheus text exposition (version 0.0.4) of
 // the Engine / Session / Node / Edge counters. The engine embeds no HTTP
 // server; the host scrapes this string from its own endpoint. Sampling is
 // lock-free on the metric side (relaxed atomics) and tolerates momentary

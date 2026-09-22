@@ -19,7 +19,6 @@
 //    replaced by the argument's text (string/integer/number/bool only);
 //  * every placeholder must be declared, every declared parameter must be
 //    used, arguments must not name undeclared parameters, and required
-//    parameters must be supplied (typo safety, 12 §11 spirit).
 
 #include <memory>
 #include <string>

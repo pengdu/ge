@@ -15,7 +15,6 @@
 namespace ge {
 
 // Structural diff between the running topology (base spec + negotiated
-// contracts) and a validated candidate (12 §7.2 A5'). Pure function of its
 // inputs, independent of which patch actions produced the candidate: the
 // runtime decides reuse vs. recreate from this and nothing else, so the
 // answer is inspectable (dry-run, operation detail) before anything runs.
@@ -30,7 +29,6 @@ namespace ge {
 //   kKept      untouched (options-only changes are not topology changes)
 // Edge classification is by edge id:
 //   kAdded / kRemoved as above
-//   kRecreated same id but a different data-plane contract (12 §8.3 fan-out
 //              re-negotiation) or a different endpoint/queue: new channel,
 //              queued packets of the old one finish on the old path
 //   kKept      same channel object, packets untouched (MUT-3)

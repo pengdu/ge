@@ -24,7 +24,6 @@ struct HostServices {
 };
 
 // ---------------------------------------------------------------------------
-// HostApiAdapter (12 §12.4, 13 §7.2): one per (Session, NodeRuntime). The
 // static ge_host_api function table recovers the adapter from host_context
 // (create/open/close) or from emit_args.callback_context (process). Emit is
 // only honoured while the process call that received the context is on the
@@ -70,7 +69,6 @@ class HostApiAdapter final {
   static void BufferRelease(ge_buffer_handle buffer);
   static ge_status BufferGetView(ge_buffer_handle buffer, ge_buffer_view* out_view);
   static ge_status Emit(const ge_emit_args* args);
-  // 12 §3.5: any thread; converts the C event (payloads retained by the
   // plugin, adopted here) into a CompletionEvent for the session's sink.
   static ge_status CompletionPush(ge_completion_sink_handle sink, const ge_completion_event* event);
   static ge_status EventPublish(const ge_event* event);
@@ -91,10 +89,8 @@ class HostApiAdapter final {
 };
 
 // ---------------------------------------------------------------------------
-// PluginOperator: Operator implemented by a C plugin vtable (13 §4.4–4.7).
 // Owns the ge_operator_handle; destroy runs from the destructor exactly
 // once. The |lease| keeps the plugin registered until the last instance is
-// gone (12 §9.3).
 // ---------------------------------------------------------------------------
 
 class PluginOperator final : public Operator {
@@ -106,7 +102,6 @@ class PluginOperator final : public Operator {
 
   Status Open(const OpenRequest& request) override;
   Result<ProcessResult> Process(const ProcessRequest& request) override;
-  // 13 §4.6: marshals the request and calls vtable.submit. Input payloads
   // stay valid for the call only; the plugin retains what it keeps.
   Status Submit(const SubmitRequest& request) override;
   Status Close(const CloseRequest& request) override;

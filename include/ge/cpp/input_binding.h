@@ -19,7 +19,6 @@ struct InputPortBinding {
   EdgeChannelRef edge;  // exactly one edge per input port
   bool required = true;
   // Retired edges that fed this port in earlier topology versions and still
-  // hold in-flight packets (12 §7.3/§7.4). Consumed FIFO up to their EOS
   // marker before |edge| is touched, so old packets keep the old path.
   std::vector<EdgeChannelRef> predecessors;
 };
@@ -28,7 +27,6 @@ struct InputBatch {
   std::vector<std::string> ports;
   std::vector<PacketRef> packets;  // parallel to |ports|
   // Packets that skipped synchronisation and go straight to on_event
-  // (12 §4.5); delivered before |packets|.
   std::vector<PacketRef> events;
 };
 
@@ -37,7 +35,6 @@ struct AlignedOptions {
   std::optional<std::string> reference_port;  // nullopt: earliest ready required port
 };
 
-// 12 §6.3 / §4.4. One per node, shared across topology versions: a
 // Mutation that changes the node's input edges calls Rebind() at publish.
 class InputBinding final {
  public:
@@ -49,7 +46,6 @@ class InputBinding final {
   [[nodiscard]] std::vector<InputPortBinding> ports() const;
   [[nodiscard]] std::optional<InputPortBinding> Find(std::string_view port) const;
 
-  // 12 §7.2 B1: swap the port table. For every port whose edge changed, the
   // previous edge (and its unfinished predecessors) become predecessors of
   // the new one. EOS state of unchanged ports is kept.
   void Rebind(std::vector<InputPortBinding> ports, SyncPolicy policy, AlignedOptions aligned);
@@ -61,11 +57,9 @@ class InputBinding final {
   // Returns a batch when the sync condition holds. Consumes packets from
   // the edges. Returns nullopt when nothing can be delivered yet.
   // Acquisition is serialized: a node with parallelism > 1 runs Process
-  // concurrently on independent batches (12 §2.4), but the binding is the
   // single consumer of its input edges.
   [[nodiscard]] std::optional<InputBatch> TryAcquire();
 
-  // True once every required port has delivered EOS (12 §4.4 step 2).
   [[nodiscard]] bool InputEnded() const noexcept;
   [[nodiscard]] std::set<std::string> eos_ports() const;  // observation (tests/snapshot)
   [[nodiscard]] std::uint64_t late_dropped() const noexcept { return late_dropped_.load(std::memory_order_relaxed); }

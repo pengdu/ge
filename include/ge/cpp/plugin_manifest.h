@@ -12,8 +12,6 @@
 
 namespace ge {
 
-// PluginManifest (14 §4, 12 §9.1). Pure data + JSON round-trip; loading and
-// descriptor cross-checks live in PluginRegistry (P4).
 struct PluginDependency {
   std::string name;
   std::string version;  // constraint text, interpreted by the registry

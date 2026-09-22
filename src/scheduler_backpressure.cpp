@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <set>
 
 #include "scheduler_internal.h"
 
@@ -46,14 +47,7 @@ bool Scheduler::HasParked(const NodeRuntime& node, const EdgeChannel& edge) cons
 
 void Scheduler::Park(NodeRuntime& node, EdgeChannel& edge, PacketRef packet) {
   EdgeChannelRef ref;
-  if (const auto topo = node.topology()) {
-    for (const EdgeChannelRef& e : topo->edges()) {
-      if (e.get() == &edge) {
-        ref = e;
-        break;
-      }
-    }
-  }
+  if (const auto topo = node.topology()) ref = topo->SharedEdgeFor(&edge);
   if (!ref) return;  // edge no longer part of the node's topology: dropped
   std::lock_guard lock(park_mutex_);
   auto& list = parked_[&node];
@@ -83,15 +77,19 @@ bool Scheduler::RetryParked(NodeRuntime& node) {
   }
   EmitReport report;
   std::vector<std::pair<EdgeChannelRef, PacketRef>> still;
+  // Edges that already refused a packet in this pass: everything queued
+  // behind them stays parked (per-edge FIFO), without rescanning |still|.
+  std::set<const EdgeChannel*> blocked;
   for (auto& [edge, packet] : work) {
-    const bool behind = std::any_of(still.begin(), still.end(),
-                                    [&](const auto& p) { return p.first == edge; });
-    if (behind) {
+    if (blocked.contains(edge.get())) {
       still.emplace_back(edge, packet);
       continue;
     }
     const PushOutcome o = PacketRouter::PushOne(*edge, packet, node, &report);
-    if (o == PushOutcome::kWouldBlock) still.emplace_back(edge, packet);
+    if (o == PushOutcome::kWouldBlock) {
+      blocked.insert(edge.get());
+      still.emplace_back(edge, packet);
+    }
   }
   bool empty = false;
   {

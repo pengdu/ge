@@ -1,7 +1,5 @@
 #ifndef GE_MEDIA_TRANSCODE_CONTROLLER_H_
 #define GE_MEDIA_TRANSCODE_CONTROLLER_H_
-
-// P6 task 3: host-side controller for one dynamic transcode session (03).
 // Wraps RenditionTemplate patches into Session::Apply / SetParameters calls,
 // tracks the live rendition set and listens to drain_timeout /
 // media_format_changed events for the session.
@@ -42,13 +40,11 @@ class TranscodeController final {
   // parameter update issued.
   [[nodiscard]] Result<ParameterUpdate> UpdateRendition(std::string_view id, const RenditionTemplate::HotUpdate& u);
   [[nodiscard]] Result<ParameterUpdate> RequestKeyFrame(std::string_view id);
-  // Codec/container switch (03 TR-U-3): the old branch is drain-removed and
   // |replacement| (a different id, usually a new output path) is added in the
   // same mutation, so the shared decoder never stops and the new encoder's
   // first packet is an IDR.
   [[nodiscard]] Result<OperationId> SwitchCodec(std::string_view id, const RenditionSpec& replacement);
 
-  // Filters (03 TR-U-6): a VideoFilter node spliced between the last filter
   // (or scale) and the encoder. Insert is an InsertChain, remove a bypass
   // RemoveChain (drain by default so no frame in the filter is lost), so
   // the rendition's encoder/mux keep running; the surrounding renditions

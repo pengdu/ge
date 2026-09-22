@@ -16,7 +16,6 @@ namespace ge {
 
 // ---------------------------------------------------------------------------
 // GraphSpec: the JSON intermediate representation of a graph
-// (14-JSON-Schema设计 §2). External node/edge ids are stable strings; the
 // engine maps them to NodeId/EdgeId internally and never writes the mapping
 // back into the spec.
 // ---------------------------------------------------------------------------
@@ -156,7 +155,6 @@ class GraphSpec final {
 };
 
 // ---------------------------------------------------------------------------
-// MutationPatch (14 §3). Actions are applied in order to a candidate GraphSpec
 // by the control plane; this header only carries the data.
 // ---------------------------------------------------------------------------
 
@@ -206,7 +204,6 @@ struct RemoveBranchAction {
   std::string entry_edge;
   std::vector<std::string> nodes;
   std::optional<RemovePolicy> remove_policy;
-  // P6: a branch may hang off several upstream ports (video + audio). When
   // non-empty this list is authoritative and |entry_edge| is ignored.
   std::vector<std::string> entry_edges;
   friend bool operator==(const RemoveBranchAction&, const RemoveBranchAction&) = default;
@@ -247,7 +244,6 @@ struct MutationPatch {
 };
 
 // ---------------------------------------------------------------------------
-// Builders (13 §6.2). Pure data transformation; no validation beyond ids.
 // ---------------------------------------------------------------------------
 
 struct EdgeOptions {
@@ -311,7 +307,6 @@ class Mutation final {
                         RemoveOptions remove = {});
   Mutation& RemoveBranch(std::string entry_edge, BranchSelection selection,
                          RemoveOptions options = {});
-  // P6: multi-entry branch (12 §7.6).
   Mutation& RemoveBranch(std::vector<std::string> entry_edges, BranchSelection selection,
                          RemoveOptions options = {});
   Mutation& AddEdge(PortRef from, PortRef to, EdgeOptions options = {});

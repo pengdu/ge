@@ -19,7 +19,6 @@
 namespace ge {
 
 // ---------------------------------------------------------------------------
-// Buffer / BufferRef (12 §2.2): intrusive refcount; fan-out shares payload.
 // ---------------------------------------------------------------------------
 
 struct Buffer;
@@ -82,7 +81,6 @@ class BufferRef final {
                                            std::int32_t device_id, BufferDeleter deleter,
                                            void* context);
 
-// Host memory pool with size classes (15 P2 task 1). Thread-safe.
 struct HostBufferPoolOptions {
   std::size_t max_cached_bytes = 64u << 20;
   std::size_t alignment = 64;
@@ -120,7 +118,6 @@ class HostBufferPool final : public std::enable_shared_from_this<HostBufferPool>
 };
 
 // ---------------------------------------------------------------------------
-// TypeTag registry (12 §2.2): builtin tags are pre-registered; opaque business
 // tags are interned on first use.
 // ---------------------------------------------------------------------------
 
@@ -144,7 +141,6 @@ class TypeTagRegistry final {
 };
 
 // ---------------------------------------------------------------------------
-// Packet (12 §2.2). Small-object metadata: sorted vector of key/value strings.
 // ---------------------------------------------------------------------------
 
 struct PacketHeader {
@@ -157,7 +153,6 @@ struct PacketHeader {
   TypeTagId type_tag = kInvalidTypeTag;
 };
 
-// Well-known metadata keys (12 §2.2).
 namespace metadata_keys {
 inline constexpr std::string_view kFormat = "format";
 inline constexpr std::string_view kError = "error";
@@ -187,7 +182,6 @@ struct Packet {
   PacketHeader header;
   std::shared_ptr<const Metadata> metadata;  // null == empty
   BufferRef payload;
-  // OBS-1 end-to-end latency (12 §12.1 SessionMetrics::end_to_end): engine
   // internal, steady-clock ns of the source emit this packet descends from.
   // Stamped by the router when a source emits, inherited from the oldest
   // input of the invocation that produced this packet, read when a sink

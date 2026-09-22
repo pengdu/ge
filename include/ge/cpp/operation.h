@@ -41,7 +41,6 @@ struct OperationRecord {
   [[nodiscard]] JsonValue ToJson() const;
 };
 
-// 13 §7.1 OperationRegistry: Create / Transition / Get. Thread-safe; waiters
 // block on a condition variable keyed by id.
 class OperationRegistry final {
  public:
@@ -56,7 +55,6 @@ class OperationRegistry final {
                                    JsonValue detail = JsonValue(JsonObject{}));
   void SetRunning(OperationId id);
   // Attaches the published topology version while the operation is still
-  // running (12 §7.2 B1 happens before B6).
   void SetTopologyVersion(OperationId id, TopologyVersion version);
   void Succeed(OperationId id, std::optional<TopologyVersion> version = std::nullopt,
                std::optional<ParameterVersion> parameter_version = std::nullopt,

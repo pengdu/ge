@@ -25,7 +25,6 @@
 
 namespace ge {
 
-// 12 §9.2
 enum class PluginState : std::uint8_t {
   kDiscovered, kValidating, kLoading, kRegistered, kActive, kRetiring,
   kLogicallyUnloaded, kPhysicallyUnloaded, kRejected
@@ -40,12 +39,11 @@ struct PluginInfo {
   std::string build_fingerprint;
   PluginState state = PluginState::kDiscovered;
   std::vector<OperatorKey> operators;
-  std::uint32_t references = 0;  // live operator instances (12 §9.3)
+  std::uint32_t references = 0;  // live operator instances
   Status rejection;              // kRejected only
   [[nodiscard]] JsonValue ToJson() const;
 };
 
-// 12 §9.3
 struct PluginReference {
   PluginId plugin_id = 0;
   OperatorKey key;
@@ -69,17 +67,14 @@ struct PluginRegistryOptions {
   std::vector<std::filesystem::path> search_paths;
   // PLG-3: must equal manifest.build_fingerprint and descriptor.build_fingerprint.
   std::string engine_fingerprint = GE_BUILD_FINGERPRINT;
-  // Host-provided dependency versions (12 §9.1 "宿主依赖版本"): name -> version.
   std::map<std::string, std::string> host_dependencies;
   // Services handed to every plugin operator.
   HostServices services;
-  // 12 §9.4 physical unload precondition "引擎线程探测通过". Returns true
   // when the plugin left no thread behind. Default: accept.
   std::function<bool(const PluginInfo&)> thread_probe;
   std::size_t audit_capacity = 4096;
 };
 
-// 12 §9, 13 §7.1: manifest validation chain, dlopen, descriptor
 // cross-checks, type@version registration, leases and logical/physical
 // unload. Doubles as the OperatorFactory of the engine.
 class PluginRegistry final : public OperatorFactory {
@@ -87,19 +82,15 @@ class PluginRegistry final : public OperatorFactory {
   explicit PluginRegistry(PluginRegistryOptions options);
   ~PluginRegistry() override;
 
-  // 12 §9.1 chain: whitelist -> manifest -> ABI -> dependencies -> dlopen ->
   // descriptor -> consistency -> conflicts -> registered. Any failure leaves
   // the registry unchanged (the rejected attempt is only audited).
   [[nodiscard]] Result<PluginInfo> Load(const std::filesystem::path& manifest_path);
   // PLG-9 dry-run: full chain without registering; the handle is closed.
   [[nodiscard]] Result<PluginInfo> DryRunLoad(const std::filesystem::path& manifest_path) const;
 
-  // Active/Registered -> Retiring: no new references (12 §9.2).
   [[nodiscard]] Status Retire(PluginId id);
-  // Retiring -> LogicallyUnloaded once references == 0 (12 §9.4). Returns
   // WOULD_BLOCK (retryable) while references remain.
   [[nodiscard]] Status LogicalUnload(PluginId id);
-  // LogicallyUnloaded -> PhysicallyUnloaded (dlclose) when 12 §9.4 holds;
   // otherwise PLUGIN_PHYSICAL_UNLOAD_UNSAFE and the logical state stays.
   [[nodiscard]] Status PhysicalUnload(PluginId id);
 
@@ -149,7 +140,6 @@ class PluginRegistry final : public OperatorFactory {
 
   PluginRegistryOptions options_;
   // Shared with every lease so operators outliving the registry (never by
-  // design, 13 §7.3, but harmless) release safely.
   std::shared_ptr<State> state_;
 };
 

@@ -1,7 +1,5 @@
 #ifndef GE_MEDIA_OPERATORS_H_
 #define GE_MEDIA_OPERATORS_H_
-
-// P6 builtin media operators (ge_media). Register them on a
 // BuiltinOperatorFactory and hand that to EngineConfig::builtin_operators.
 //
 //   MediaDemux@1.0.0    source: input_path -> video(EncodedVideo), audio(EncodedAudio)
@@ -13,6 +11,8 @@
 //   VideoEncode@1.0.0   VideoFrame -> EncodedVideo (codec/bitrate/gop; hot: bitrate_kbps, gop, force_idr)
 //   AudioEncode@1.0.0   AudioFrame -> EncodedAudio (aac; bitrate_kbps)
 //   MediaMux@1.0.0      sink: video(+audio) -> output_path (flv|mp4)
+//   VideoCompose@1.0.0  N x VideoFrame -> VideoFrame (grid/PiP layout, alignment, compensation)
+//   AudioMix@1.0.0      N x AudioFrame -> AudioFrame (per-member gain/mute)
 //
 // All operators are stateful, parallelism 1, software backends; other
 // CodecBackend values are accepted by the option parser and rejected at
@@ -35,9 +35,10 @@ inline constexpr std::string_view kOpVideoFilter = "VideoFilter@1.0.0";
 inline constexpr std::string_view kOpVideoEncode = "VideoEncode@1.0.0";
 inline constexpr std::string_view kOpAudioEncode = "AudioEncode@1.0.0";
 inline constexpr std::string_view kOpMediaMux = "MediaMux@1.0.0";
+inline constexpr std::string_view kOpVideoCompose = "VideoCompose@1.0.0";
+inline constexpr std::string_view kOpAudioMix = "AudioMix@1.0.0";
 
 // Event type published by VideoEncode ahead of every keyframe that starts
-// a new stream configuration (12 §4.5 / §12.2).
 inline constexpr std::string_view kEventMediaFormatChanged = "media_format_changed";
 
 // Event type published by a segmenting MediaMux (output_pattern) each time
@@ -54,6 +55,8 @@ inline constexpr std::string_view kEventMediaSegment = "media_segment";
 [[nodiscard]] CapabilityDescriptor VideoEncodeCapability();
 [[nodiscard]] CapabilityDescriptor AudioEncodeCapability();
 [[nodiscard]] CapabilityDescriptor MediaMuxCapability();
+[[nodiscard]] CapabilityDescriptor VideoComposeCapability();
+[[nodiscard]] CapabilityDescriptor AudioMixCapability();
 
 // Factories.
 [[nodiscard]] std::unique_ptr<Operator> MakeMediaDemux(const OperatorCreateArgs& args);
@@ -65,6 +68,8 @@ inline constexpr std::string_view kEventMediaSegment = "media_segment";
 [[nodiscard]] std::unique_ptr<Operator> MakeVideoEncode(const OperatorCreateArgs& args);
 [[nodiscard]] std::unique_ptr<Operator> MakeAudioEncode(const OperatorCreateArgs& args);
 [[nodiscard]] std::unique_ptr<Operator> MakeMediaMux(const OperatorCreateArgs& args);
+[[nodiscard]] std::unique_ptr<Operator> MakeVideoCompose(const OperatorCreateArgs& args);
+[[nodiscard]] std::unique_ptr<Operator> MakeAudioMix(const OperatorCreateArgs& args);
 
 // Registers every operator above.
 void RegisterMediaOperators(BuiltinOperatorFactory& factory);

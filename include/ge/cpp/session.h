@@ -29,7 +29,6 @@
 
 namespace ge {
 
-// 12 §2.4a
 enum class SessionState : std::uint8_t {
   kCreated, kStarting, kRunning, kPausing, kPaused, kStopping, kStopped, kFailed
 };
@@ -38,27 +37,20 @@ enum class SessionState : std::uint8_t {
 struct SessionOptions {
   SessionId id = 1;
   AlignedOptions aligned;
-  // 12 §7.7 default drain deadline (transcode branches: 2s).
   std::chrono::milliseconds drain_timeout{2000};
-  // 12 §7.1 merge limit for compatible queued mutations.
   std::size_t mutation_merge_limit = 8;
   // true: a dedicated coordinator thread consumes the MutationQueue
-  // (12 §2.5). false: the host pumps it with Session::PumpMutations() --
   // deterministic tests with an inline ExecutorPool.
   bool coordinator_thread = true;
-  // REL-2 (retries arrive with P5): a node failure fails the session and
   // fast-stops the graph.
   bool fail_session_on_node_failure = true;
-  // P5: shared engine AsyncRuntime (null: async operators cannot run).
   AsyncRuntime* async_runtime = nullptr;
   // ASY-7 session-level batching switch.
   bool batching = true;
-  // 12 §10 / TD-03: shared engine ledger (null: no admission). Session::Create
   // reserves the initial graph; every mutation reserves its added nodes and
   // edges at Prepare A6 and returns the removed ones when their retire
   // completes. Rejections are RESOURCE_EXHAUSTED with RES-3 context.
   ResourceLedger* resource_ledger = nullptr;
-  // 12 §10.3: an edge whose packet bound cannot be derived (audio, bytes,
   // json, custom tags without queue.max_packet_bytes) is rejected at
   // admission instead of merely being left out of the budget.
   bool reject_unbudgeted_edges = false;
@@ -74,11 +66,9 @@ struct SessionEvents {
   std::function<void(NodeRuntime&, const Status&)> on_node_failed;
   std::function<void(TopologyVersion published)> on_topology_published;
   std::function<void(TopologyVersion retired_version)> on_drain_timeout;
-  // P6: builtin operator event (ProcessRequest::events); executor thread.
   std::function<void(NodeRuntime&, std::string type, Severity, JsonValue detail)> on_operator_event;
 };
 
-// 12 §7.1 MutationRequest.
 struct MutationRequest {
   OperationId operation = 0;
   MutationPatch patch;
@@ -89,12 +79,10 @@ struct DryRunResult {
   GraphSpec candidate;
   ValidatedGraph validated;
   // Structural diff against the base version: what the runtime would keep,
-  // rebind, recreate or retire (12 §7.2 A5').
   GraphDiff diff;
   [[nodiscard]] JsonValue ToJson() const;
 };
 
-// 13 §6.3
 struct ParameterUpdate {
   ParameterVersion version = 0;
   OperationId operation = 0;
@@ -102,9 +90,7 @@ struct ParameterUpdate {
 
 class Session;
 
-// 12 §7 / 13 §7.1: serial two-phase mutation orchestration for one Session.
 // Prepare never touches the running graph; Publish is the atomic swap;
-// Retire progress is driven by the Scheduler (12 §7.7) and completes the
 // operation.
 class MutationCoordinator final {
  public:
@@ -113,7 +99,6 @@ class MutationCoordinator final {
 
   // Enqueue (FIFO). The operation is already registered as accepted.
   void Submit(MutationRequest request);
-  // Processes the queue head (merging compatible successors, 12 §7.1) on the
   // calling thread. Returns false if the queue was empty. Must not be called
   // from an executor thread.
   bool Pump();
@@ -164,9 +149,7 @@ class MutationCoordinator final {
   std::mutex execute_mutex_;  // one Execute at a time (Pump vs thread)
 };
 
-// 12 §2.5 Session: atomic current topology, state machine (12 §2.4a),
 // MutationQueue, RetiredTopologyList (inside Scheduler) and parameter
-// updates (12 §5).
 class Session final {
  public:
   [[nodiscard]] static Result<std::unique_ptr<Session>> Create(
@@ -182,7 +165,6 @@ class Session final {
   [[nodiscard]] TopologyVersion topology_version() const { return current_topology()->version(); }
   [[nodiscard]] const Status& failure() const noexcept { return failure_; }
 
-  // Lifecycle (12 §2.4a). Start opens every node (12 §7.2 A7 semantics for
   // the initial graph) then runs.
   [[nodiscard]] Status Start();
   [[nodiscard]] Status Pause();
@@ -192,20 +174,15 @@ class Session final {
   [[nodiscard]] Result<OperationId> Stop(bool fast, CallerContext caller = {});
   [[nodiscard]] bool WaitStopped(std::chrono::milliseconds timeout);
 
-  // Mutation (12 §7). Accepted only in running/paused.
   [[nodiscard]] Result<OperationId> Apply(MutationPatch patch, CallerContext caller = {});
   [[nodiscard]] Result<DryRunResult> DryRun(const MutationPatch& patch) const;
   // Host-side pump when SessionOptions::coordinator_thread == false.
   bool PumpMutations() { return coordinator_.Pump(); }
 
-  // Parameters (12 §5, PAR-2..7). Accepted only in running/paused.
   [[nodiscard]] Result<ParameterUpdate> SetParameters(std::string_view node_id, JsonValue parameters,
                                                       CallerContext caller = {});
-
-  // OBS-3 snapshot: state, version, nodes, edges, contracts, parameters.
   [[nodiscard]] JsonValue Snapshot() const;
 
-  // Watchdog entry (12 §7.7): drives drain deadlines and EOS retries.
   void Tick() { scheduler_.Tick(); }
   [[nodiscard]] CompletionSink* completion_sink() const noexcept { return sink_.get(); }
 
@@ -213,7 +190,6 @@ class Session final {
   [[nodiscard]] Scheduler& scheduler() noexcept { return scheduler_; }
   [[nodiscard]] const Scheduler& scheduler() const noexcept { return scheduler_; }
   [[nodiscard]] const SessionOptions& options() const noexcept { return options_; }
-  // 12 §10 admission (RES-1..4). One lease per session holds the running
   // sum of every live node/edge estimate; Prepare A6 grows it by the
   // candidate's additions (all-or-nothing, RESOURCE_EXHAUSTED with RES-3
   // context on failure) and a completed retire shrinks it by the removals.

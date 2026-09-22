@@ -1,0 +1,22 @@
+@PACKAGE_INIT@
+
+include (CMakeFindDependencyMacro)
+find_dependency (Threads)
+
+set (GE_HAS_MEDIA @GE_CONFIG_HAS_MEDIA@)
+set (GE_HAS_ONNX @GE_CONFIG_HAS_ONNX@)
+
+if (GE_HAS_MEDIA OR GE_HAS_ONNX)
+  find_dependency (PkgConfig)
+endif ()
+if (GE_HAS_MEDIA)
+  pkg_check_modules (FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale libswresample
+                     libavfilter)
+endif ()
+if (GE_HAS_ONNX)
+  pkg_check_modules (ONNXRUNTIME REQUIRED IMPORTED_TARGET libonnxruntime)
+endif ()
+
+include ("${CMAKE_CURRENT_LIST_DIR}/geTargets.cmake")
+
+check_required_components (ge)

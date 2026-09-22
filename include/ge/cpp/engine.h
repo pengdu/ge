@@ -29,7 +29,6 @@
 
 namespace ge {
 
-// 13 §5.1 ge_engine_config in C++ form.
 struct EngineConfig {
   std::vector<std::filesystem::path> plugin_search_paths;
   std::map<std::string, std::string> host_dependencies;
@@ -42,14 +41,11 @@ struct EngineConfig {
   std::size_t audit_capacity = 4096;
   std::optional<std::string> engine_fingerprint;  // tests only; default GE_BUILD_FINGERPRINT
   std::chrono::milliseconds default_drain_timeout{2000};
-  // P5: async runtime (worker thread follows cpu_threads != 0 unless set).
   AsyncOptions async;
   std::optional<bool> async_worker_thread;
-  // P6: host-provided builtin operators (e.g. ge_media). Consulted before
   // the PluginRegistry by CreateSession/GetCapability; UpgradeOperator stays
   // plugin-only (builtins have no plugin lifecycle; use ReplaceNode).
   std::shared_ptr<OperatorFactory> builtin_operators;
-  // TD-03 (12 §10): ledger capacities. Empty means
   // ResourceLedger::DefaultCapacities(cpu_threads) at construction;
   // resource_limits_json `resources` overrides per (kind[@device]).
   // `admission: false` disables the ledger entirely (no session ever
@@ -58,7 +54,6 @@ struct EngineConfig {
   bool resource_admission = true;
   bool reject_unbudgeted_edges = false;
 
-  // ge_engine_config JSON fields (13 §5.1).
   [[nodiscard]] static Result<EngineConfig> FromJson(const char* plugin_search_paths_json,
                                                      const char* resource_limits_json,
                                                      const char* observability_config_json);
@@ -72,7 +67,6 @@ struct SessionUpgradeResult {
   [[nodiscard]] JsonValue ToJson() const;
 };
 
-// 13 §6.3
 struct UpgradeReport {
   OperationId operation = 0;
   PluginId old_plugin = 0;
@@ -87,14 +81,11 @@ struct RetirePluginOptions {
   bool request_physical_unload = false;
 };
 
-// 13 §7.3 Engine: PluginRegistry, ExecutorPool, OperationRegistry,
-// EventBus, Watchdog and SessionManager (12 §12.4).
 class Engine final {
  public:
   [[nodiscard]] static Result<std::unique_ptr<Engine>> Create(EngineConfig config);
   ~Engine();
 
-  // Plugins (12 §9).
   [[nodiscard]] Result<PluginInfo> LoadPlugin(const std::filesystem::path& manifest);
   // Retire -> (refs == 0) logical unload -> optional physical unload. The
   // operation completes when the logical unload happened (or immediately
@@ -102,7 +93,6 @@ class Engine final {
   // and the watchdog finishes it.
   [[nodiscard]] Result<OperationId> RetirePlugin(PluginId id, RetirePluginOptions options = {},
                                                  CallerContext caller = {});
-  // 12 §9.3 UpgradeAndRetire: per-session ReplaceNode, aggregated, no
   // cross-session rollback. Blocks until every session's mutation finished
   // (bounded by each session's drain timeout).
   [[nodiscard]] Result<UpgradeReport> UpgradeOperator(const OperatorKey& old_key,
@@ -110,7 +100,6 @@ class Engine final {
                                                       CallerContext caller = {});
   [[nodiscard]] Result<CapabilityDescriptor> GetCapability(const OperatorKey& key) const;
 
-  // Sessions (12 §12.4 SessionManager).
   [[nodiscard]] Result<Session*> CreateSession(const GraphSpec& spec, CallerContext caller = {},
                                                OperationId* out_operation = nullptr);
   // GM-3 batch reuse: validates |tmpl|'s skeleton against this engine's
@@ -129,11 +118,9 @@ class Engine final {
   // Live sessions pinned for the caller (a concurrent DestroySession cannot
   // free them mid-walk). Used by RenderPrometheus.
   [[nodiscard]] std::vector<std::shared_ptr<Session>> SessionRefs() const;
-  // OBS-2: Prometheus text exposition of every metric (12 §12.1); see
   // include/ge/cpp/metrics_export.h.
   [[nodiscard]] std::string RenderPrometheus();
 
-  // Watchdog (13 §7.1): drains deadlines, EOS retries, plugin unload
   // completion. Called by the watchdog thread or by the host.
   void Tick();
 

@@ -22,14 +22,12 @@ namespace ge {
 
 class RuntimeTopology;
 
-// 12 §6.1
 enum class NodeState : std::uint8_t {
   kCreated, kOpening, kReady, kRunning, kAsyncPending, kDraining, kClosing, kClosed, kFailed
 };
 [[nodiscard]] std::string_view ToString(NodeState s) noexcept;
 
 // ---------------------------------------------------------------------------
-// ParameterStore (12 §5): control plane writes serially, data plane reads
 // lock-free through the atomic shared_ptr.
 // ---------------------------------------------------------------------------
 
@@ -68,7 +66,6 @@ class ParameterStore final {
   std::optional<ParameterVersion> SwitchAtPacketBoundary(PacketSeq seq);
   [[nodiscard]] bool has_pending() const;
   [[nodiscard]] std::vector<ParameterAuditRecord> history() const;
-  // Plugin rejected the update: drop pending, keep current (12 §5).
   void RejectPending();
 
  private:
@@ -84,10 +81,8 @@ class ParameterStore final {
 };
 
 // ---------------------------------------------------------------------------
-// NodeMetrics (12 §12.1 subset needed by P2/P5)
 // ---------------------------------------------------------------------------
 
-// 12 §12.1 fixed-bucket, lock-free latency histogram. Bucket i holds
 // samples < 2^(i+10) ns: 1µs, 2µs, ... 2^34 ns (~17s) over 25 buckets, the
 // last bucket everything above (so end-to-end latencies of realtime
 // pipelines, seconds, still resolve to a bucket).
@@ -119,8 +114,7 @@ struct NodeMetrics {
   std::atomic<std::uint64_t> errors{0};
   std::atomic<std::uint64_t> would_block{0};
   std::atomic<std::uint64_t> process_ns_total{0};
-  LatencyHistogram process_latency;  // one sample per Process call (OBS-1 P50/P99)
-  // Async (12 §12.1): submit -> completion, batch sizes, gaps, orphans.
+  LatencyHistogram process_latency;  // one sample per Process call
   std::atomic<std::uint64_t> submitted{0};
   std::atomic<std::uint64_t> completed{0};
   LatencyHistogram async_wait;
@@ -136,7 +130,6 @@ struct NodeMetrics {
   std::atomic<std::int64_t> current_ingress_ns{0};
 };
 
-// 12 §12.1 SessionMetrics.
 struct SessionMetrics {
   std::atomic<std::uint64_t> mutations_succeeded{0};
   std::atomic<std::uint64_t> mutations_failed{0};
@@ -145,12 +138,10 @@ struct SessionMetrics {
   std::atomic<std::uint64_t> drain_timeouts{0};
   LatencyHistogram mutation_publish;  // Apply accepted -> topology swapped
   LatencyHistogram mutation_retire;   // swap -> last removed node closed
-  LatencyHistogram end_to_end;        // source emit -> sink consume (OBS-1)
+  LatencyHistogram end_to_end;        // source emit -> sink consume
 };
 
 // ---------------------------------------------------------------------------
-// NodeRuntime (12 §2.4): identity, operator instance, state, parameters,
-// in-flight accounting and the ready-state machine of 12 §6.1. Topology
 // (routes, inputs) is *not* owned here.
 // ---------------------------------------------------------------------------
 
@@ -184,7 +175,6 @@ class NodeRuntime final : public std::enable_shared_from_this<NodeRuntime> {
   [[nodiscard]] Status Close(const CloseRequest& request);
   void Fail(Status status);
 
-  // 12 §6.1: TrySchedule reserves one slot (single node: Idle->Ready CAS;
   // N>1: available_slots--). Returns false when no slot / not schedulable.
   [[nodiscard]] bool TrySchedule() noexcept;
   // Releases a slot without invoking (input turned out not ready).
@@ -195,11 +185,9 @@ class NodeRuntime final : public std::enable_shared_from_this<NodeRuntime> {
   void EndInvoke() noexcept;
   void NoteSeq(PacketSeq seq) noexcept { last_seq_.store(seq, std::memory_order_relaxed); }
 
-  // EOS lifecycle (12 §4.4 step 3/4).
   [[nodiscard]] bool TryEnterDraining() noexcept;  // ready/running & in_flight==0 -> draining
   void EnterClosing() noexcept;
 
-  // Async accounting (12 §4.3 step 6, §4.4 step 7): requests submitted to
   // the backend and not yet delivered/dropped. Draining waits for zero.
   // Async operators run single-slot (submission order == seq order).
   [[nodiscard]] bool is_async() const noexcept { return capability_.execution.async; }
@@ -219,10 +207,8 @@ class NodeRuntime final : public std::enable_shared_from_this<NodeRuntime> {
   void EnterAsyncPending() noexcept;
   [[nodiscard]] bool TryLeaveAsyncPending() noexcept;
 
-  // Fast-retire marker: subsequent emits are rejected (12 §7.7).
   void MarkCancelled() noexcept { cancelled_.store(true, std::memory_order_release); }
   [[nodiscard]] bool cancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
-  // Drain-retire marker (12 §7.7): a removed source stops pulling and
   // finishes (flush + EOS) on its next turn.
   void MarkRetiring() noexcept { retiring_.store(true, std::memory_order_release); }
   [[nodiscard]] bool retiring() const noexcept { return retiring_.load(std::memory_order_acquire); }
@@ -245,7 +231,6 @@ class NodeRuntime final : public std::enable_shared_from_this<NodeRuntime> {
            available_slots_.load(std::memory_order_seq_cst) == max_parallelism_;
   }
 
-  // Routing snapshot (12 §4.1 step 1 / §7.7): the topology whose RouteTable
   // this node emits through. Kept nodes are moved to Vn+1 at publish;
   // removed nodes keep Vn until closed.
   void SetTopology(std::shared_ptr<const RuntimeTopology> topology) noexcept {

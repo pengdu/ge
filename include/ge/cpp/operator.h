@@ -17,14 +17,10 @@
 
 namespace ge {
 
-// Engine-side operator contract mirroring the C ABI vtable (13 §4.4–4.5).
-// In-process test operators implement this directly; P4 adapts C plugins.
 // Everything here runs on an executor thread; the engine guarantees no two
 // invocations of one instance overlap unless max_parallelism > 1.
 
-// Negotiated contract of one port (12 §8.2), handed to builtin operators at
 // Open so they can pick the agreed pixel/sample format. C++ only; C plugins
-// keep receiving the contract through their capability JSON (P6).
 struct PortContract {
   std::string port;  // owned: the topology's port lists are returned by value
   const ConnectionContract* contract = nullptr;
@@ -34,7 +30,6 @@ struct OpenRequest {
   SessionId session_id = 0;
   TopologyVersion topology_version = 0;
   const JsonValue* options = nullptr;
-  // P6 tail fields (append-only).
   std::vector<PortContract> input_contracts;
   std::vector<PortContract> output_contracts;
   NodeId node_id = 0;
@@ -57,14 +52,12 @@ struct CloseRequest {
 };
 
 // Emits are only valid while the process call that received the context is
-// on the stack (13 §4.5).
 class EmitSink {
  public:
   virtual ~EmitSink() = default;
   virtual Status Emit(std::string_view output_port, Packet packet) = 0;
 };
 
-// Runtime event publication for builtin operators (12 §12.2); the C ABI
 // equivalent is ge_host_services.event_publish. Events land on the
 // engine EventBus attributed to the calling node.
 class EventSink {
@@ -82,11 +75,9 @@ struct ProcessRequest {
   std::vector<PacketRef> inputs;  // parallel to input_ports
   const JsonValue* parameters = nullptr;
   EmitSink* sink = nullptr;
-  // P6 tail field (append-only): may be null for FLUSH from a retired path.
   EventSink* events = nullptr;
 };
 
-// Source semantics (12 §4.4 step 1): a node without inputs is invoked with
 // input_count == 0 and no FLUSH flag; it returns kExhausted when it will not
 // produce again, after which the scheduler sends EOS on its outputs.
 enum class ProcessResult : std::uint8_t {
@@ -95,7 +86,6 @@ enum class ProcessResult : std::uint8_t {
 };
 
 // ---------------------------------------------------------------------------
-// Asynchronous contract (12 §3.5–3.6, 13 §4.6). Submit must return without
 // waiting for the backend; the result arrives later through
 // CompletionSink::Push from any thread. One completion per request_id.
 // ---------------------------------------------------------------------------
@@ -115,7 +105,6 @@ struct CompletionEvent {
   std::vector<CompletionOutput> outputs;
 };
 
-// Owned by the Session (one per session, 12 §3.5); valid for the operator
 // until Close returned and every submitted request completed.
 class CompletionSink {
  public:
@@ -163,13 +152,11 @@ struct OperatorCreateArgs {
 };
 
 // Creates in-process operators for a given key. Backed by PluginRegistry
-// from P4 on; tests/samples register builtin factories.
 class OperatorFactory {
  public:
   virtual ~OperatorFactory() = default;
   [[nodiscard]] virtual const CapabilityDescriptor* Describe(const OperatorKey& key) const = 0;
   [[nodiscard]] virtual Result<std::unique_ptr<Operator>> Create(const OperatorCreateArgs& args) = 0;
-  // TD-03 / 12 §10.2 "Estimate(Node)": what one instance with these options
   // will take. Default: the descriptor's static resources.amounts (empty
   // for an unknown key). Builtins may register a per-instance estimator
   // (OnnxInfer: intra_threads x workers, model size).
@@ -200,7 +187,6 @@ class BuiltinOperatorFactory final : public OperatorFactory {
   std::vector<Entry> entries_;
 };
 
-// Ordered lookup over several factories (13 §6.1): the engine puts the
 // host's builtin operators first and the PluginRegistry last, so a builtin
 // key always wins over a plugin that happens to declare the same one.
 class CompositeOperatorFactory final : public OperatorFactory {

@@ -1,7 +1,6 @@
 #ifndef GE_MEDIA_FRAME_H_
 #define GE_MEDIA_FRAME_H_
 
-// Media payload conventions (12 §2.2a, P6).
 //
 //   VideoFrame / AudioFrame  payload = one AVFrame*  (size = sizeof(AVFrame))
 //   EncodedVideo / EncodedAudio payload = one AVPacket* (size = sizeof(AVPacket))
