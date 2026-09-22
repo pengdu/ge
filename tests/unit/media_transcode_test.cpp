@@ -5,9 +5,11 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ge/cpp/engine.h>
+#include <ge/cpp/mutation_applier.h>
 #include <ge/media/operators.h>
 #include <ge/media/rendition.h>
 #include <ge/media/testing.h>
@@ -120,12 +122,16 @@ ProbeResult Probe(const std::string& path) {
 
 TEST(MediaCapabilityTest, OperatorsRegisterAndNegotiate) {
   auto f = MakeMediaOperatorFactory();
-  for (std::string_view key : {kOpMediaDemux, kOpVideoDecode, kOpAudioDecode, kOpVideoScale, kOpVideoConvert, kOpVideoEncode,
-                               kOpAudioEncode, kOpMediaMux}) {
+  for (std::string_view key : {kOpMediaDemux, kOpVideoDecode, kOpAudioDecode, kOpVideoScale, kOpVideoConvert, kOpVideoFilter,
+                               kOpVideoEncode, kOpAudioEncode, kOpMediaMux}) {
     EXPECT_NE(f->Describe(*ge::OperatorKey::Parse(key)), nullptr) << key;
   }
   EXPECT_EQ(VideoEncodeCapability().parameters.hot_updatable, (std::vector<std::string>{"bitrate_kbps", "gop", "force_idr"}));
   EXPECT_EQ(VideoScaleCapability().parameters.hot_updatable, (std::vector<std::string>{"watermark"}));
+  EXPECT_EQ(VideoFilterCapability().parameters.hot_updatable, (std::vector<std::string>{"filter"}));
+  EXPECT_TRUE(ValidateFilterChain("drawbox=x=0:y=0:w=8:h=8:color=white:t=fill").ok());
+  EXPECT_EQ(ValidateFilterChain("nosuchfilter=1").code(), GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ValidateFilterChain("drawbox=nosuchoption=1").code(), GE_STATUS_INVALID_ARGUMENT);
   EXPECT_FALSE(PreferredVideoEncoder("h264").empty());
 }
 
@@ -155,6 +161,59 @@ TEST(RenditionTemplateTest, GraphAndPatchesUseStableIds) {
   r.width = 1280;
   r.id = "bad id";
   EXPECT_EQ(RenditionTemplate::ValidateSpec(r).code(), GE_STATUS_INVALID_ARGUMENT);
+}
+
+TEST(RenditionTemplateTest, FilterPatchesFollowTheEdgeThatFeedsTheEncoder) {
+  RenditionTemplate::BaseOptions base;
+  base.input_path = "x.mp4";
+  RenditionSpec r;
+  r.id = "p720";
+  r.output_path = "o.flv";
+  auto g = RenditionTemplate::Graph(base, {r});
+  ASSERT_TRUE(g.ok());
+  const RenditionNodeIds ids = RenditionTemplate::Ids("p720");
+  EXPECT_EQ(ids.Filter("text"), "r.p720.f.text");
+
+  // First filter splits the template's scale->venc edge.
+  const FilterSpec text{"text", "drawbox=x=0:y=0:w=8:h=8:color=white:t=fill"};
+  auto entry = RenditionTemplate::FilterEntryEdge(*g, "p720");
+  ASSERT_TRUE(entry.ok());
+  EXPECT_EQ(*entry, ids.scale_venc_edge);
+  auto ins = RenditionTemplate::InsertFilter(*g, "p720", text);
+  ASSERT_TRUE(ins.ok()) << ins.status().ToString();
+  ASSERT_EQ(ins->actions.size(), 1U);
+  const auto& ic = std::get<ge::InsertChainAction>(ins->actions[0]);
+  EXPECT_EQ(ic.edge, ids.scale_venc_edge);
+  ASSERT_EQ(ic.nodes.size(), 1U);
+  EXPECT_EQ(ic.nodes[0].id, "r.p720.f.text");
+  EXPECT_EQ(ic.nodes[0].op.ToString(), kOpVideoFilter);
+
+  // Apply it to the spec the way the engine would; the next filter then
+  // splits the derived edge between the first filter and the encoder.
+  ge::MutationApplier applier(nullptr);
+  auto cand = applier.Apply(*g, *ins);
+  ASSERT_TRUE(cand.ok()) << cand.status().ToString();
+  auto entry2 = RenditionTemplate::FilterEntryEdge(cand->candidate, "p720");
+  ASSERT_TRUE(entry2.ok());
+  EXPECT_EQ(*entry2, "r.p720.f.text.out->r.p720.venc.in");
+  EXPECT_EQ(RenditionTemplate::InsertFilter(cand->candidate, "p720", text).status().code(), GE_STATUS_ALREADY_EXISTS);
+
+  // Removal bypasses; the bypass edge is scale->venc again (derived name).
+  const ge::MutationPatch rm = RenditionTemplate::RemoveFilter("p720", "text", ge::RemovePolicy::kDrain);
+  ASSERT_EQ(rm.actions.size(), 1U);
+  const auto& rc = std::get<ge::RemoveChainAction>(rm.actions[0]);
+  EXPECT_EQ(rc.nodes, (std::vector<std::string>{"r.p720.f.text"}));
+  EXPECT_EQ(rc.mode, ge::RemoveMode::kBypass);
+  auto cand2 = applier.Apply(cand->candidate, rm);
+  ASSERT_TRUE(cand2.ok()) << cand2.status().ToString();
+  auto entry3 = RenditionTemplate::FilterEntryEdge(cand2->candidate, "p720");
+  ASSERT_TRUE(entry3.ok());
+  EXPECT_EQ(*entry3, "r.p720.scale.out->r.p720.venc.in");
+
+  EXPECT_EQ(RenditionTemplate::ValidateFilter(FilterSpec{"bad id", "null"}).code(), GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(RenditionTemplate::ValidateFilter(FilterSpec{"f", ""}).code(), GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(RenditionTemplate::ValidateFilter(FilterSpec{"f", "nosuchfilter"}).code(), GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(RenditionTemplate::FilterEntryEdge(*g, "nope").status().code(), GE_STATUS_NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +426,127 @@ TEST(MediaTranscodeTest, HotUpdatesBitrateGopWatermarkAndForcedIdr) {
   EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
 }
 
+// 03 TR-U-6: a filter (here a white drawbox in the top-left corner, the
+// same box the watermark test reads back) is inserted and removed on a
+// live rendition several times. The rendition never stops (every frame of
+// the input reaches the file, PTS stay monotonic), a sibling rendition is
+// untouched, and the box is visible exactly while the filter is in.
+TEST(MediaTranscodeTest, FilterInsertRemoveLoopKeepsRenditionContinuous) {
+  Fixture f("filter", 150);
+  const RenditionSpec r = f.Rendition("r", 320, 180, "flv");
+  const RenditionSpec other = f.Rendition("o", 160, 90, "mp4");
+  auto g = RenditionTemplate::Graph(f.Base(), {r, other});
+  ASSERT_TRUE(g.ok());
+  auto s = f.engine->CreateSession(*g);
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ge::Session* session = *s;
+  TranscodeController ctl(*f.engine, *session, f.Base(), {r, other});
+  ASSERT_TRUE(session->Start().ok());
+
+  const FilterSpec box{"box", "drawbox=x=0:y=0:w=80:h=40:color=white:t=fill"};
+  // [frame index at insert, frame index at remove) per round.
+  std::vector<std::pair<std::int64_t, std::int64_t>> windows;
+  const ge::TopologyVersion v0 = session->topology_version();
+  for (int round = 0; round < 3; ++round) {
+    while (f.PacketsOut(session, "r.r.venc") < 20 + 40 * round) f.Turns(session, 1);
+    const std::int64_t at_insert = f.PacketsOut(session, "r.r.venc");
+    auto ins = ctl.InsertFilter("r", box);
+    ASSERT_TRUE(ins.ok()) << ins.status().ToString();
+    auto rec = ctl.Wait(*ins, std::chrono::seconds(10));
+    ASSERT_TRUE(rec.ok()) << rec.status().ToString();
+    EXPECT_EQ(rec->state, ge::OperationState::kSucceeded) << rec->result.ToString();
+    ASSERT_EQ(ctl.Filters("r").size(), 1U);
+    EXPECT_EQ(ctl.Filters("r")[0], box);
+    EXPECT_NE(session->current_topology()->FindNode("r.r.f.box"), nullptr);
+    // A second insert of the same id is rejected without touching the graph.
+    EXPECT_EQ(ctl.InsertFilter("r", box).status().code(), GE_STATUS_ALREADY_EXISTS);
+
+    while (f.PacketsOut(session, "r.r.venc") < 40 + 40 * round) f.Turns(session, 1);
+    const std::int64_t at_remove = f.PacketsOut(session, "r.r.venc");
+    auto rm = ctl.RemoveFilter("r", "box", /*drain=*/round % 2 == 0);
+    ASSERT_TRUE(rm.ok()) << rm.status().ToString();
+    auto rrec = ctl.Wait(*rm, std::chrono::seconds(10));
+    ASSERT_TRUE(rrec.ok()) << rrec.status().ToString();
+    EXPECT_EQ(rrec->state, ge::OperationState::kSucceeded) << rrec->result.ToString();
+    EXPECT_TRUE(ctl.Filters("r").empty());
+    EXPECT_EQ(session->current_topology()->FindNode("r.r.f.box"), nullptr);
+    EXPECT_EQ(ctl.RemoveFilter("r", "box").status().code(), GE_STATUS_NOT_FOUND);
+    windows.emplace_back(at_insert, at_remove);
+  }
+  // Six published versions: insert + remove per round.
+  EXPECT_EQ(session->topology_version(), v0 + 6);
+  EXPECT_EQ(ctl.InsertFilter("nope", box).status().code(), GE_STATUS_NOT_FOUND);
+  EXPECT_EQ(ctl.InsertFilter("r", FilterSpec{"bad", "nosuchfilter"}).status().code(), GE_STATUS_INVALID_ARGUMENT);
+
+  ASSERT_TRUE(f.RunToStop(session));
+  EXPECT_EQ(session->state(), ge::SessionState::kStopped) << session->failure().ToString();
+  EXPECT_EQ(ctl.stats().node_failures, 0U);
+
+  const ProbeResult pr = Probe(r.output_path);
+  EXPECT_EQ(pr.video_packets, 150) << pr.ToJson().Serialize();  // TR-C-1: nothing lost across six splices
+  EXPECT_TRUE(pr.trailer_ok);
+  EXPECT_TRUE(pr.first_video_is_key);
+  for (std::size_t i = 1; i < pr.video_pts_ms.size(); ++i) {
+    EXPECT_GT(pr.video_pts_ms[i], pr.video_pts_ms[i - 1]) << "pts not monotonic at " << i;
+  }
+  const ProbeResult po = Probe(other.output_path);
+  EXPECT_EQ(po.video_packets, 150) << po.ToJson().Serialize();
+  EXPECT_TRUE(po.trailer_ok);
+  // The box is bright strictly inside each window and dark well outside it
+  // (a few frames of slack for the packets in flight between scale and the
+  // encoder when the splice landed).
+  for (const auto& [ins, rm] : windows) {
+    const double inside = AverageLuma(r.output_path, ins + 8, 0, 0, 80, 40);
+    const double after = AverageLuma(r.output_path, rm + 8, 0, 0, 80, 40);
+    const double before = AverageLuma(r.output_path, ins - 6, 0, 0, 80, 40);
+    EXPECT_GT(inside, 200) << "window [" << ins << "," << rm << ") inside=" << inside;
+    EXPECT_LT(after, 200) << "window [" << ins << "," << rm << ") after=" << after;
+    EXPECT_LT(before, 200) << "window [" << ins << "," << rm << ") before=" << before;
+  }
+  EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
+}
+
+// Hot update of the chain (TR-U-1 for filters): the box moves from the
+// top-left to the top-right corner without a topology change.
+TEST(MediaTranscodeTest, FilterHotUpdateMovesBoxWithoutTopologyChange) {
+  Fixture f("filterhot", 90);
+  const RenditionSpec r = f.Rendition("r", 320, 180, "flv");
+  auto g = RenditionTemplate::Graph(f.Base(), {r});
+  ASSERT_TRUE(g.ok());
+  auto s = f.engine->CreateSession(*g);
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ge::Session* session = *s;
+  TranscodeController ctl(*f.engine, *session, f.Base(), {r});
+  ASSERT_TRUE(session->Start().ok());
+
+  auto ins = ctl.InsertFilter("r", FilterSpec{"box", "drawbox=x=0:y=0:w=80:h=40:color=white:t=fill"});
+  ASSERT_TRUE(ins.ok()) << ins.status().ToString();
+  auto rec = ctl.Wait(*ins, std::chrono::seconds(10));
+  ASSERT_TRUE(rec.ok()) << rec.status().ToString();
+  EXPECT_EQ(rec->state, ge::OperationState::kSucceeded) << rec->result.ToString();
+  const ge::TopologyVersion v1 = session->topology_version();
+
+  while (f.PacketsOut(session, "r.r.venc") < 40) f.Turns(session, 1);
+  const std::int64_t at_update = f.PacketsOut(session, "r.r.venc");
+  auto up = ctl.UpdateFilter("r", "box", "drawbox=x=240:y=0:w=80:h=40:color=white:t=fill");
+  ASSERT_TRUE(up.ok()) << up.status().ToString();
+  EXPECT_EQ(ctl.Filters("r")[0].chain, "drawbox=x=240:y=0:w=80:h=40:color=white:t=fill");
+  EXPECT_EQ(ctl.UpdateFilter("r", "box", "nosuchfilter").status().code(), GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ctl.UpdateFilter("r", "nope", "null").status().code(), GE_STATUS_NOT_FOUND);
+
+  ASSERT_TRUE(f.RunToStop(session));
+  EXPECT_EQ(session->state(), ge::SessionState::kStopped) << session->failure().ToString();
+  EXPECT_EQ(session->topology_version(), v1);
+  const ProbeResult pr = Probe(r.output_path);
+  EXPECT_EQ(pr.video_packets, 90);
+  EXPECT_TRUE(pr.trailer_ok);
+  EXPECT_GT(AverageLuma(r.output_path, at_update - 6, 0, 0, 80, 40), 200);
+  EXPECT_LT(AverageLuma(r.output_path, at_update - 6, 240, 0, 80, 40), 200);
+  EXPECT_LT(AverageLuma(r.output_path, 85, 0, 0, 80, 40), 200);
+  EXPECT_GT(AverageLuma(r.output_path, 85, 240, 0, 80, 40), 200);
+  EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
+}
+
 TEST(MediaTranscodeTest, SwitchCodecReplacesBranchWithoutStoppingSharedDecoder) {
   Fixture f("codec", 90);
   const RenditionSpec r0 = f.Rendition("h264", 320, 180, "mp4");
@@ -442,5 +622,49 @@ TEST(MediaTranscodeTest, ThreadedEngineRealtimeAddAndRemove) {
   EXPECT_GT(b.video_packets, 0);
   EXPECT_TRUE(b.first_video_is_key);
   EXPECT_TRUE(b.trailer_ok) << b.ToJson().Serialize();
+  EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
+}
+
+// The user-facing variant of the filter scene: a drawtext overlay (needs
+// libfreetype + a font; skipped where either is missing) toggled on and
+// off a realtime rendition on the threaded engine, with the file checked
+// for continuity afterwards.
+TEST(MediaTranscodeTest, ThreadedRealtimeDrawtextToggle) {
+  const std::string text = "drawtext=text='LIVE':x=8:y=8:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.5";
+  if (ge::Status s = ValidateFilterChain(text); !s.ok()) GTEST_SKIP() << "drawtext unavailable: " << s.ToString();
+  Fixture f("drawtext", 90, 30, /*threads=*/true);
+  RenditionTemplate::BaseOptions base = f.Base();
+  base.realtime = true;
+  const RenditionSpec r0 = f.Rendition("a", 320, 180, "flv");
+  auto g = RenditionTemplate::Graph(base, {r0});
+  ASSERT_TRUE(g.ok());
+  auto s = f.engine->CreateSession(*g);
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ge::Session* session = *s;
+  TranscodeController ctl(*f.engine, *session, base, {r0});
+  ASSERT_TRUE(session->Start().ok());
+  for (int round = 0; round < 3; ++round) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto ins = ctl.InsertFilter("a", FilterSpec{"live", text});
+    ASSERT_TRUE(ins.ok()) << ins.status().ToString();
+    auto rec = ctl.Wait(*ins, std::chrono::seconds(5));
+    ASSERT_TRUE(rec.ok()) << rec.status().ToString();
+    EXPECT_EQ(rec->state, ge::OperationState::kSucceeded) << rec->result.ToString();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto rm = ctl.RemoveFilter("a", "live", /*drain=*/round != 1);
+    ASSERT_TRUE(rm.ok()) << rm.status().ToString();
+    auto rrec = ctl.Wait(*rm, std::chrono::seconds(5));
+    ASSERT_TRUE(rrec.ok()) << rrec.status().ToString();
+    EXPECT_EQ(rrec->state, ge::OperationState::kSucceeded) << rrec->result.ToString();
+  }
+  ASSERT_TRUE(session->WaitStopped(std::chrono::seconds(10)));
+  EXPECT_EQ(session->state(), ge::SessionState::kStopped) << session->failure().ToString();
+  EXPECT_EQ(ctl.stats().node_failures, 0U);
+  const ProbeResult a = Probe(r0.output_path);
+  EXPECT_EQ(a.video_packets, 90) << a.ToJson().Serialize();
+  EXPECT_TRUE(a.trailer_ok);
+  for (std::size_t i = 1; i < a.video_pts_ms.size(); ++i) {
+    EXPECT_GT(a.video_pts_ms[i], a.video_pts_ms[i - 1]) << "pts not monotonic at " << i;
+  }
   EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
 }

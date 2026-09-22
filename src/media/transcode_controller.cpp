@@ -1,5 +1,6 @@
 #include <ge/media/transcode_controller.h>
 
+#include <algorithm>
 #include <thread>
 
 #include <ge/media/operators.h>
@@ -51,8 +52,59 @@ Result<OperationId> TranscodeController::RemoveRendition(std::string_view id, bo
   Result<OperationId> op = session_.Apply(RenditionTemplate::RemoveRendition(id, policy, spec->audio, base_));
   if (!op.ok()) return op;
   renditions_.erase(std::string(id));
+  filters_.erase(std::string(id));
   pending_removals_.emplace(*op, std::make_pair(std::string(id), drain));
   return op;
+}
+
+Result<OperationId> TranscodeController::InsertFilter(std::string_view id, const FilterSpec& filter) {
+  std::lock_guard lock(mutex_);
+  if (!Lookup(id)) return Status::NotFound("rendition '" + std::string(id) + "' not found");
+  std::vector<FilterSpec>& filters = filters_[std::string(id)];
+  Result<MutationPatch> patch = RenditionTemplate::InsertFilter(session_.current_topology()->spec(), id, filter);
+  if (!patch.ok()) return patch.status();
+  Result<OperationId> op = session_.Apply(std::move(*patch));
+  if (!op.ok()) return op;
+  filters.push_back(filter);
+  return op;
+}
+
+Result<OperationId> TranscodeController::RemoveFilter(std::string_view id, std::string_view filter_id, bool drain) {
+  std::lock_guard lock(mutex_);
+  if (!Lookup(id)) return Status::NotFound("rendition '" + std::string(id) + "' not found");
+  std::vector<FilterSpec>& filters = filters_[std::string(id)];
+  const auto it = std::find_if(filters.begin(), filters.end(), [&](const FilterSpec& f) { return f.id == filter_id; });
+  if (it == filters.end()) {
+    return Status::NotFound("filter '" + std::string(filter_id) + "' not found in rendition '" + std::string(id) + "'");
+  }
+  const RemovePolicy policy = drain ? RemovePolicy::kDrain : RemovePolicy::kFast;
+  Result<OperationId> op = session_.Apply(RenditionTemplate::RemoveFilter(id, filter_id, policy));
+  if (!op.ok()) return op;
+  filters.erase(it);
+  return op;
+}
+
+Result<ParameterUpdate> TranscodeController::UpdateFilter(std::string_view id, std::string_view filter_id,
+                                                          std::string_view chain) {
+  std::lock_guard lock(mutex_);
+  if (!Lookup(id)) return Status::NotFound("rendition '" + std::string(id) + "' not found");
+  std::vector<FilterSpec>& filters = filters_[std::string(id)];
+  const auto it = std::find_if(filters.begin(), filters.end(), [&](const FilterSpec& f) { return f.id == filter_id; });
+  if (it == filters.end()) {
+    return Status::NotFound("filter '" + std::string(filter_id) + "' not found in rendition '" + std::string(id) + "'");
+  }
+  if (Status s = ValidateFilterChain(chain); !s.ok()) return s;
+  Result<ParameterUpdate> r =
+      session_.SetParameters(RenditionTemplate::Ids(id).Filter(filter_id), RenditionTemplate::FilterParameters(chain));
+  if (!r.ok()) return r;
+  it->chain = std::string(chain);
+  return r;
+}
+
+std::vector<FilterSpec> TranscodeController::Filters(std::string_view id) const {
+  std::lock_guard lock(mutex_);
+  const auto it = filters_.find(std::string(id));
+  return it == filters_.end() ? std::vector<FilterSpec>{} : it->second;
 }
 
 Result<ParameterUpdate> TranscodeController::UpdateRendition(std::string_view id, const RenditionTemplate::HotUpdate& u) {
@@ -100,6 +152,7 @@ Result<OperationId> TranscodeController::SwitchCodec(std::string_view id, const 
   Result<OperationId> op = session_.Apply(std::move(patch));
   if (!op.ok()) return op;
   renditions_.erase(std::string(id));
+  filters_.erase(std::string(id));
   renditions_.emplace(replacement.id, replacement);
   pending_removals_.emplace(*op, std::make_pair(std::string(id), true));
   return op;

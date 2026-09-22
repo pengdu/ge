@@ -48,6 +48,22 @@ class TranscodeController final {
   // first packet is an IDR.
   [[nodiscard]] Result<OperationId> SwitchCodec(std::string_view id, const RenditionSpec& replacement);
 
+  // Filters (03 TR-U-6): a VideoFilter node spliced between the last filter
+  // (or scale) and the encoder. Insert is an InsertChain, remove a bypass
+  // RemoveChain (drain by default so no frame in the filter is lost), so
+  // the rendition's encoder/mux keep running; the surrounding renditions
+  // are untouched. Update hot-swaps the chain at the next frame boundary.
+  // Insert splits the edge that feeds the encoder in the *published*
+  // topology, so Wait() for a previous filter change on the same rendition
+  // before issuing the next one.
+  [[nodiscard]] Result<OperationId> InsertFilter(std::string_view id, const FilterSpec& filter);
+  [[nodiscard]] Result<OperationId> RemoveFilter(std::string_view id, std::string_view filter_id, bool drain = true);
+  [[nodiscard]] Result<ParameterUpdate> UpdateFilter(std::string_view id, std::string_view filter_id,
+                                                     std::string_view chain);
+  // Current filter order (scale side first) of a rendition; empty when the
+  // rendition is unknown.
+  [[nodiscard]] std::vector<FilterSpec> Filters(std::string_view id) const;
+
   // Waits for an operation, pumping the session when the engine runs its
   // executor inline (cpu_threads == 0).
   [[nodiscard]] Result<OperationRecord> Wait(OperationId op, std::chrono::milliseconds timeout);
@@ -67,6 +83,7 @@ class TranscodeController final {
   RenditionTemplate::BaseOptions base_;
   mutable std::mutex mutex_;
   std::map<std::string, RenditionSpec> renditions_;
+  std::map<std::string, std::vector<FilterSpec>> filters_;  // rendition id -> filters, scale side first
   std::map<OperationId, std::pair<std::string, bool>> pending_removals_;  // op -> (id, drain)
   SubscriptionId subscription_ = 0;
   std::atomic<std::uint64_t> drain_timeouts_{0};

@@ -20,7 +20,7 @@ $SUDO apt-get install -y --no-install-recommends \
   gcc g++ clang \
   libgtest-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev \
-  ffmpeg
+  ffmpeg fonts-dejavu-core
 
 arch="$(uname -m)"
 case "$arch" in

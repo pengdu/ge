@@ -102,6 +102,17 @@ CapabilityDescriptor VideoScaleCapability() {
   return d;
 }
 
+CapabilityDescriptor VideoFilterCapability() {
+  CapabilityDescriptor d = Base(kOpVideoFilter, "libavfilter chain (drawtext, overlay, ...) between two VideoFrame ports");
+  d.inputs = {VideoPort("in", PortDirection::kInput, DecodedPixelFormats())};
+  d.outputs = {VideoPort("out", PortDirection::kOutput, EncoderPixelFormats(), PortCardinality::kMulti)};
+  d.parameters.hot_updatable = {"filter"};
+  d.parameters.schema = JsonValue(JsonObject{{"type", JsonValue("object")},
+                                             {"properties", JsonValue(JsonObject{{"filter", JsonValue(JsonObject{{"type", JsonValue("string")}})}})},
+                                             {"required", JsonValue(JsonArray{JsonValue("filter")})}});
+  return d;
+}
+
 CapabilityDescriptor VideoConvertCapability() {
   CapabilityDescriptor d = Base(kOpVideoConvert, "swscale pixel format conversion");
   d.inputs = {VideoPort("in", PortDirection::kInput, DecodedPixelFormats())};
@@ -150,6 +161,7 @@ void RegisterMediaOperators(BuiltinOperatorFactory& factory) {
   factory.Register(AudioDecodeCapability(), &MakeAudioDecode);
   factory.Register(VideoScaleCapability(), &MakeVideoScale);
   factory.Register(VideoConvertCapability(), &MakeVideoConvert);
+  factory.Register(VideoFilterCapability(), &MakeVideoFilter);
   factory.Register(VideoEncodeCapability(), &MakeVideoEncode);
   factory.Register(AudioEncodeCapability(), &MakeAudioEncode);
   factory.Register(MediaMuxCapability(), &MakeMediaMux);

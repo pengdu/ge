@@ -47,6 +47,11 @@ RenditionNodeIds RenditionTemplate::Ids(std::string_view rendition_id) {
   return ids;
 }
 
+std::string RenditionNodeIds::Filter(std::string_view filter_id) const {
+  // scale is "r.<id>.scale"; the filter shares the "r.<id>." prefix.
+  return scale.substr(0, scale.size() - 5) + "f." + std::string(filter_id);
+}
+
 Status RenditionTemplate::ValidateSpec(const RenditionSpec& spec) {
   if (!IsValidStableId(spec.id) || spec.id.size() > 64) {
     return Status::InvalidArgument("rendition id '" + spec.id + "' is not a valid stable id");
@@ -179,6 +184,61 @@ MutationPatch RenditionTemplate::RemoveRendition(std::string_view rendition_id, 
   m.SetRemovePolicy(policy);
   m.RemoveBranch(std::move(entries), BranchSelection{{ids.scale, ids.venc, ids.mux}}, RemoveOptions{policy});
   return m.patch();
+}
+
+Status RenditionTemplate::ValidateFilter(const FilterSpec& filter) {
+  if (!IsValidStableId(filter.id) || filter.id.size() > 64) {
+    return Status::InvalidArgument("filter id '" + filter.id + "' is not a valid stable id");
+  }
+  if (filter.chain.empty()) return Status::InvalidArgument("filter '" + filter.id + "': chain is required");
+  return ValidateFilterChain(filter.chain);
+}
+
+NodeSpec RenditionTemplate::FilterNode(std::string_view rendition_id, const FilterSpec& filter) {
+  NodeSpec n;
+  n.id = Ids(rendition_id).Filter(filter.id);
+  n.op = Key(kOpVideoFilter);
+  n.options = JsonValue(JsonObject{{"filter", JsonValue(filter.chain)}});
+  return n;
+}
+
+Result<std::string> RenditionTemplate::FilterEntryEdge(const GraphSpec& current, std::string_view rendition_id) {
+  const RenditionNodeIds ids = Ids(rendition_id);
+  if (current.FindNode(ids.venc) == nullptr) {
+    return Status::NotFound("rendition '" + std::string(rendition_id) + "' is not in the graph");
+  }
+  const std::vector<const EdgeSpec*> in = current.EdgesToPort(PortRef{ids.venc, "in"});
+  if (in.size() != 1) {
+    return Status::GraphInvalid("rendition '" + std::string(rendition_id) + "': expected exactly one edge into " + ids.venc +
+                                ".in, found " + std::to_string(in.size()));
+  }
+  return in.front()->id;
+}
+
+Result<MutationPatch> RenditionTemplate::InsertFilter(const GraphSpec& current, std::string_view rendition_id,
+                                                      const FilterSpec& filter) {
+  if (Status s = ValidateFilter(filter); !s.ok()) return s;
+  const NodeSpec node = FilterNode(rendition_id, filter);
+  if (current.FindNode(node.id) != nullptr) {
+    return Status::AlreadyExists("filter '" + filter.id + "' exists in rendition '" + std::string(rendition_id) + "'");
+  }
+  Result<std::string> edge = FilterEntryEdge(current, rendition_id);
+  if (!edge.ok()) return edge.status();
+  Mutation m;
+  m.InsertChain(std::move(*edge), {node}, ChainPorts{.chain_input = "in", .chain_output = "out"});
+  return m.patch();
+}
+
+MutationPatch RenditionTemplate::RemoveFilter(std::string_view rendition_id, std::string_view filter_id,
+                                              RemovePolicy policy) {
+  Mutation m;
+  m.SetRemovePolicy(policy);
+  m.RemoveChain({Ids(rendition_id).Filter(filter_id)}, RemoveChainOptions{.bypass = true, .remove_policy = policy});
+  return m.patch();
+}
+
+JsonValue RenditionTemplate::FilterParameters(std::string_view chain) {
+  return JsonValue(JsonObject{{"filter", JsonValue(std::string(chain))}});
 }
 
 JsonValue RenditionTemplate::EncoderParameters(const HotUpdate& u) {

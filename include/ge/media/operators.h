@@ -9,6 +9,7 @@
 //   AudioDecode@1.0.0   EncodedAudio -> AudioFrame
 //   VideoScale@1.0.0    VideoFrame -> VideoFrame  (width/height, hot: watermark)
 //   VideoConvert@1.0.0  VideoFrame -> VideoFrame  (pixel format per contract)
+//   VideoFilter@1.0.0   VideoFrame -> VideoFrame  (any libavfilter chain, e.g. drawtext; hot: filter)
 //   VideoEncode@1.0.0   VideoFrame -> EncodedVideo (codec/bitrate/gop; hot: bitrate_kbps, gop, force_idr)
 //   AudioEncode@1.0.0   AudioFrame -> EncodedAudio (aac; bitrate_kbps)
 //   MediaMux@1.0.0      sink: video(+audio) -> output_path (flv|mp4)
@@ -30,6 +31,7 @@ inline constexpr std::string_view kOpVideoDecode = "VideoDecode@1.0.0";
 inline constexpr std::string_view kOpAudioDecode = "AudioDecode@1.0.0";
 inline constexpr std::string_view kOpVideoScale = "VideoScale@1.0.0";
 inline constexpr std::string_view kOpVideoConvert = "VideoConvert@1.0.0";
+inline constexpr std::string_view kOpVideoFilter = "VideoFilter@1.0.0";
 inline constexpr std::string_view kOpVideoEncode = "VideoEncode@1.0.0";
 inline constexpr std::string_view kOpAudioEncode = "AudioEncode@1.0.0";
 inline constexpr std::string_view kOpMediaMux = "MediaMux@1.0.0";
@@ -44,6 +46,7 @@ inline constexpr std::string_view kEventMediaFormatChanged = "media_format_chang
 [[nodiscard]] CapabilityDescriptor AudioDecodeCapability();
 [[nodiscard]] CapabilityDescriptor VideoScaleCapability();
 [[nodiscard]] CapabilityDescriptor VideoConvertCapability();
+[[nodiscard]] CapabilityDescriptor VideoFilterCapability();
 [[nodiscard]] CapabilityDescriptor VideoEncodeCapability();
 [[nodiscard]] CapabilityDescriptor AudioEncodeCapability();
 [[nodiscard]] CapabilityDescriptor MediaMuxCapability();
@@ -54,6 +57,7 @@ inline constexpr std::string_view kEventMediaFormatChanged = "media_format_chang
 [[nodiscard]] std::unique_ptr<Operator> MakeAudioDecode(const OperatorCreateArgs& args);
 [[nodiscard]] std::unique_ptr<Operator> MakeVideoScale(const OperatorCreateArgs& args);
 [[nodiscard]] std::unique_ptr<Operator> MakeVideoConvert(const OperatorCreateArgs& args);
+[[nodiscard]] std::unique_ptr<Operator> MakeVideoFilter(const OperatorCreateArgs& args);
 [[nodiscard]] std::unique_ptr<Operator> MakeVideoEncode(const OperatorCreateArgs& args);
 [[nodiscard]] std::unique_ptr<Operator> MakeAudioEncode(const OperatorCreateArgs& args);
 [[nodiscard]] std::unique_ptr<Operator> MakeMediaMux(const OperatorCreateArgs& args);
@@ -61,6 +65,11 @@ inline constexpr std::string_view kEventMediaFormatChanged = "media_format_chang
 // Registers every operator above.
 void RegisterMediaOperators(BuiltinOperatorFactory& factory);
 [[nodiscard]] std::shared_ptr<BuiltinOperatorFactory> MakeMediaOperatorFactory();
+
+// Parses a libavfilter chain (the VideoFilter "filter" option) against a
+// throwaway 64x64 yuv420p source; lets a host reject a bad chain before it
+// issues the mutation (the operator's Open runs the same check).
+[[nodiscard]] Status ValidateFilterChain(std::string_view chain);
 
 // Encoder availability probe (which H.264 encoder Open would pick, or
 // "mpeg4" fallback). Lets tests avoid hard-coding codec names.

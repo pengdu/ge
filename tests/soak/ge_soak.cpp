@@ -6,8 +6,11 @@
 //
 // Scene A (transcode): a looping realtime demux feeding a rendition ladder.
 // Every ~7s a rendition is added or drain-removed, every ~3s a hot update
-// (bitrate/gop/watermark/IDR) lands, every ~40s one rendition switches
-// codec/container. Outputs go to DIR and are truncated by re-adding.
+// (bitrate/gop/watermark/IDR) lands, every ~5s a VideoFilter (drawtext when
+// the build has it, drawbox otherwise) is inserted into / removed from the
+// always-on rendition (hot-updating its chain while in), every ~40s one
+// rendition switches codec/container. Outputs go to DIR and are truncated
+// by re-adding.
 //
 // Scene B (inference): a synthetic tensor source through OnnxInfer to a
 // checking sink, session recreated every ~30s (create/start/drain/destroy
@@ -149,6 +152,7 @@ struct Verdict {
 
 struct TranscodeScene {
   std::atomic<std::uint64_t> adds{0}, removes{0}, hot_updates{0}, switches{0}, resource_rejections{0};
+  std::atomic<std::uint64_t> filter_inserts{0}, filter_removes{0}, filter_updates{0};
   std::atomic<std::uint64_t> failed_ops{0};
 
   void Run(ge::Engine& engine, const Options& opt, Verdict& verdict) {
@@ -210,6 +214,16 @@ struct TranscodeScene {
       return true;
     };
 
+    // Filter chains: drawtext needs libfreetype (Ubuntu CI has it, Homebrew
+    // FFmpeg does not); fall back to a drawbox so the splice path is always
+    // exercised.
+    const std::string text_a = "drawtext=text='LIVE':x=8:y=8:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.5";
+    const std::string text_b = "drawtext=text='REC':x=w-tw-8:y=8:fontsize=28:fontcolor=red";
+    const bool have_drawtext = ValidateFilterChain(text_a).ok();
+    const std::string chain_a = have_drawtext ? text_a : "drawbox=x=8:y=8:w=96:h=32:color=white:t=fill";
+    const std::string chain_b = have_drawtext ? text_b : "drawbox=x=iw-104:y=8:w=96:h=32:color=red:t=fill";
+    bool filter_in = false;
+
     const auto t0 = Clock::now();
     unsigned step = 0;
     int codec_switch_gen = 0;
@@ -255,6 +269,27 @@ struct TranscodeScene {
           (void)ctl.UpdateRendition(main_id, clear);
         }
       }
+      if (step % 5 == 0) {
+        // Toggle the overlay on the always-on rendition; while it is in,
+        // alternate the two chains through the hot path.
+        if (!filter_in) {
+          if (wait(ctl.InsertFilter(main_id, FilterSpec{"overlay", chain_a}), "insert filter")) {
+            filter_in = true;
+            ++filter_inserts;
+          }
+        } else if ((step / 5) % 3 != 0) {
+          auto r = ctl.UpdateFilter(main_id, "overlay", ((step / 5) % 2) ? chain_b : chain_a);
+          if (!r.ok()) {
+            ++failed_ops;
+            verdict.Fail("filter update: " + r.status().ToString());
+          } else {
+            ++filter_updates;
+          }
+        } else if (wait(ctl.RemoveFilter(main_id, "overlay", /*drain=*/(step / 5) % 2 == 0), "remove filter")) {
+          filter_in = false;
+          ++filter_removes;
+        }
+      }
       if (step % 7 == 0) {
         const std::size_t i = (step / 7) % 3;
         if (!present[i]) {
@@ -281,6 +316,7 @@ struct TranscodeScene {
         if (wait(ctl.SwitchCodec(main_id, replacement), "switch codec")) {
           main_id = replacement.id;
           added_at[main_id] = Clock::now();
+          filter_in = false;  // the filter left with the old branch
           ++switches;
           ++codec_switch_gen;
         }
@@ -621,8 +657,8 @@ int main(int argc, char** argv) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0).count();
     std::printf(
         "[soak] t=%llds rss=%.1fMB fds=%ld sessions=%s async_inflight=%s leases=%s audit_dropped=%s "
-        "e2e_p99_ms=%s adds=%llu removes=%llu hot=%llu switches=%llu res_rej=%llu infer_cycles=%llu "
-        "infer_results=%llu mismatches=%llu\n",
+        "e2e_p99_ms=%s adds=%llu removes=%llu hot=%llu filters=%llu/%llu/%llu switches=%llu res_rej=%llu "
+        "infer_cycles=%llu infer_results=%llu mismatches=%llu\n",
         static_cast<long long>(elapsed), rss, OpenFds(), PromValue(prom, "ge_engine_sessions ").c_str(),
         PromValue(prom, "ge_engine_async_in_flight ").c_str(), PromValue(prom, "ge_engine_resource_leases ").c_str(),
         PromValue(prom, "ge_engine_audit_dropped_total ").c_str(),
@@ -640,6 +676,9 @@ int main(int argc, char** argv) {
             .c_str(),
         static_cast<unsigned long long>(transcode.adds.load()), static_cast<unsigned long long>(transcode.removes.load()),
         static_cast<unsigned long long>(transcode.hot_updates.load()),
+        static_cast<unsigned long long>(transcode.filter_inserts.load()),
+        static_cast<unsigned long long>(transcode.filter_removes.load()),
+        static_cast<unsigned long long>(transcode.filter_updates.load()),
         static_cast<unsigned long long>(transcode.switches.load()),
         static_cast<unsigned long long>(transcode.resource_rejections.load() + infer.resource_rejections.load()),
         static_cast<unsigned long long>(infer.cycles.load()), static_cast<unsigned long long>(infer.check.results.load()),
@@ -688,6 +727,9 @@ int main(int argc, char** argv) {
     o["transcode_adds"] = ge::JsonValue(transcode.adds.load());
     o["transcode_removes"] = ge::JsonValue(transcode.removes.load());
     o["transcode_hot_updates"] = ge::JsonValue(transcode.hot_updates.load());
+    o["transcode_filter_inserts"] = ge::JsonValue(transcode.filter_inserts.load());
+    o["transcode_filter_removes"] = ge::JsonValue(transcode.filter_removes.load());
+    o["transcode_filter_updates"] = ge::JsonValue(transcode.filter_updates.load());
     o["transcode_switches"] = ge::JsonValue(transcode.switches.load());
     o["resource_rejections"] = ge::JsonValue(transcode.resource_rejections.load() + infer.resource_rejections.load());
     o["infer_cycles"] = ge::JsonValue(infer.cycles.load());
@@ -698,11 +740,14 @@ int main(int argc, char** argv) {
     o["failures"] = ge::JsonValue(std::move(fails));
     std::printf("%s\n", ge::JsonValue(std::move(o)).Serialize().c_str());
   } else {
-    std::printf("[soak] %s: adds=%llu removes=%llu hot=%llu switches=%llu infer_cycles=%llu infer_results=%llu "
-                "res_rej=%llu audit_failures=%zu\n",
+    std::printf("[soak] %s: adds=%llu removes=%llu hot=%llu filters=%llu/%llu/%llu switches=%llu infer_cycles=%llu "
+                "infer_results=%llu res_rej=%llu audit_failures=%zu\n",
                 ok ? "PASS" : "FAIL", static_cast<unsigned long long>(transcode.adds.load()),
                 static_cast<unsigned long long>(transcode.removes.load()),
                 static_cast<unsigned long long>(transcode.hot_updates.load()),
+                static_cast<unsigned long long>(transcode.filter_inserts.load()),
+                static_cast<unsigned long long>(transcode.filter_removes.load()),
+                static_cast<unsigned long long>(transcode.filter_updates.load()),
                 static_cast<unsigned long long>(transcode.switches.load()),
                 static_cast<unsigned long long>(infer.cycles.load()),
                 static_cast<unsigned long long>(infer.check.results.load()),

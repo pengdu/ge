@@ -203,6 +203,7 @@ if (GE_ENABLE_MEDIA)
     src/media/media_demux.cpp
     src/media/video_decode.cpp
     src/media/video_scale.cpp
+    src/media/video_filter.cpp
     src/media/video_encode.cpp
     src/media/audio_encode.cpp
     src/media/media_mux.cpp

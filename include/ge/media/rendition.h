@@ -9,6 +9,9 @@
 // Rendition <id> (three nodes, four edges, two entry edges):
 //   vdec.out -> r.<id>.scale -> r.<id>.venc -> r.<id>.mux.video
 //   aenc.out ------------------------------> r.<id>.mux.audio
+// Filters (03 TR-U-6) are VideoFilter nodes r.<id>.f.<filter> spliced into
+// the scale -> venc path with InsertChain and taken out again with a
+// bypass RemoveChain, so the encoder and mux never reopen.
 
 #include <optional>
 #include <string>
@@ -48,6 +51,17 @@ struct RenditionNodeIds {
   std::string scale, venc, mux;
   std::string video_entry_edge, audio_entry_edge;
   std::string scale_venc_edge, venc_mux_edge;
+  // Node id of filter |filter_id| in this rendition.
+  [[nodiscard]] std::string Filter(std::string_view filter_id) const;
+};
+
+// One VideoFilter stage inside a rendition. |chain| is a libavfilter
+// description ("drawtext=text='hi':x=10:y=10:fontsize=24:fontcolor=white");
+// hot-updatable through UpdateFilter.
+struct FilterSpec {
+  std::string id;  // stable id fragment, unique within the rendition
+  std::string chain;
+  friend bool operator==(const FilterSpec&, const FilterSpec&) = default;
 };
 
 struct TranscodeBaseOptions {
@@ -98,6 +112,20 @@ class RenditionTemplate final {
   [[nodiscard]] static NodeSpec ScaleNode(const RenditionSpec& spec);
   [[nodiscard]] static NodeSpec EncodeNode(const RenditionSpec& spec);
   [[nodiscard]] static NodeSpec MuxNode(const RenditionSpec& spec);
+
+  // Filters (03 TR-U-6). The new filter goes right before the encoder,
+  // i.e. it splits whatever edge currently feeds r.<id>.venc.in in
+  // |current| (the session's live GraphSpec): the template's own
+  // scale-venc edge at first, later the derived "<from>-><to>" edges
+  // InsertChain / bypass leave behind (14 §3.2).
+  [[nodiscard]] static Status ValidateFilter(const FilterSpec& filter);
+  [[nodiscard]] static NodeSpec FilterNode(std::string_view rendition_id, const FilterSpec& filter);
+  [[nodiscard]] static Result<std::string> FilterEntryEdge(const GraphSpec& current, std::string_view rendition_id);
+  [[nodiscard]] static Result<MutationPatch> InsertFilter(const GraphSpec& current, std::string_view rendition_id,
+                                                          const FilterSpec& filter);
+  [[nodiscard]] static MutationPatch RemoveFilter(std::string_view rendition_id, std::string_view filter_id,
+                                                  RemovePolicy policy);
+  [[nodiscard]] static JsonValue FilterParameters(std::string_view chain);
 };
 
 }  // namespace ge::media
