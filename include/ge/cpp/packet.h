@@ -187,6 +187,12 @@ struct Packet {
   PacketHeader header;
   std::shared_ptr<const Metadata> metadata;  // null == empty
   BufferRef payload;
+  // OBS-1 end-to-end latency (12 §12.1 SessionMetrics::end_to_end): engine
+  // internal, steady-clock ns of the source emit this packet descends from.
+  // Stamped by the router when a source emits, inherited from the oldest
+  // input of the invocation that produced this packet, read when a sink
+  // consumes it. 0 == unknown (not crossing the C ABI; plugins never see it).
+  std::int64_t ingress_ns = 0;
 
   [[nodiscard]] bool is_eos() const noexcept { return header.flags & GE_PACKET_FLAG_EOS; }
   [[nodiscard]] bool is_event() const noexcept { return header.flags & GE_PACKET_FLAG_EVENT; }

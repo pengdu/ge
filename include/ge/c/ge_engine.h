@@ -85,6 +85,13 @@ GE_EXPORT ge_status ge_engine_query_audit_json(ge_engine_handle engine,
                                                const char* filter_json,
                                                char** out_json);
 
+/* OBS-2 (12 §12.1): Prometheus text exposition (format 0.0.4) of every
+ * engine / session / node / edge metric. The engine embeds no HTTP server:
+ * the host serves this string from its own scrape endpoint. Free with
+ * ge_string_free. Tail-appended (13 §3.1). */
+GE_EXPORT ge_status ge_engine_render_prometheus(ge_engine_handle engine,
+                                                char** out_text);
+
 #ifdef __cplusplus
 }
 #endif

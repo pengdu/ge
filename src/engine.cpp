@@ -1,6 +1,7 @@
 #include <ge/cpp/engine.h>
 
 #include <ge/cpp/graph_spec_json.h>
+#include <ge/cpp/metrics_export.h>
 
 #include <algorithm>
 #include <charconv>
@@ -707,5 +708,15 @@ std::vector<SessionId> Engine::Sessions() const {
   for (const auto& [id, s] : sessions_) out.push_back(id);
   return out;
 }
+
+std::vector<std::shared_ptr<Session>> Engine::SessionRefs() const {
+  std::lock_guard lock(sessions_mutex_);
+  std::vector<std::shared_ptr<Session>> out;
+  out.reserve(sessions_.size());
+  for (const auto& [id, s] : sessions_) out.push_back(s);
+  return out;
+}
+
+std::string Engine::RenderPrometheus() { return ge::RenderPrometheus(*this); }
 
 }  // namespace ge

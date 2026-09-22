@@ -130,6 +130,10 @@ struct EmitReport {
   PacketRef packet;
 };
 
+// OBS-1 end-to-end helpers (Packet::ingress_ns).
+[[nodiscard]] std::int64_t SteadyNowNs() noexcept;
+[[nodiscard]] std::int64_t OldestIngress(const std::vector<PacketRef>& inputs) noexcept;
+
 // Stateless: routes through the RouteTable of the topology snapshot the
 // node is bound to (12 §4.1 step 1; retired nodes keep Vn, 12 §7.7).
 class PacketRouter final {

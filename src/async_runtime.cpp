@@ -259,6 +259,7 @@ RequestId AsyncRuntime::Submit(SubmitArgs args) {
   entry.node = args.node;
   entry.topology_ref = args.topology;
   entry.seq = args.packet_seq;
+  entry.ingress_ns = OldestIngress(args.inputs);
   entry.enqueued = now;
   entry.deadline = now + inference_timeout;  // refined at flush
 
@@ -640,12 +641,14 @@ void AsyncRuntime::DeliverEntry(Entry& entry, const SessionEntry* session) {
       if (same_edge) {
         out.packet.header.topology_version = entry.topology;
         out.packet.header.parameter_version = entry.parameter;
+        if (out.packet.ingress_ns == 0) out.packet.ingress_ns = entry.ingress_ns;
         if (out.packet.header.type_tag == kInvalidTypeTag) out.packet.header.type_tag = routes->front().type_tag;
         PacketRef shared = std::make_shared<const Packet>(std::move(out.packet));
         for (const RouteEntry& r : *routes) parked.pushes.emplace_back(r.edge.get(), shared);
         continue;
       }
     }
+    if (out.packet.ingress_ns == 0) out.packet.ingress_ns = entry.ingress_ns;
     Status st = PacketRouter::Emit(*entry.topology_ref, node, out.output_port, std::move(out.packet),
                                    entry.parameter, &one);
     report.accepted += one.accepted;

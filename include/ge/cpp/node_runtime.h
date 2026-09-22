@@ -100,6 +100,9 @@ class LatencyHistogram final {
   [[nodiscard]] std::uint64_t P50() const noexcept { return Quantile(0.5); }
   [[nodiscard]] std::uint64_t P99() const noexcept { return Quantile(0.99); }
   [[nodiscard]] static std::uint64_t BucketUpperNs(std::size_t bucket) noexcept;
+  [[nodiscard]] std::uint64_t BucketCount(std::size_t bucket) const noexcept {
+    return buckets_[bucket].load(std::memory_order_relaxed);
+  }
 
  private:
   std::array<std::atomic<std::uint64_t>, kBuckets> buckets_{};
@@ -114,6 +117,7 @@ struct NodeMetrics {
   std::atomic<std::uint64_t> errors{0};
   std::atomic<std::uint64_t> would_block{0};
   std::atomic<std::uint64_t> process_ns_total{0};
+  LatencyHistogram process_latency;  // one sample per Process call (OBS-1 P50/P99)
   // Async (12 §12.1): submit -> completion, batch sizes, gaps, orphans.
   std::atomic<std::uint64_t> submitted{0};
   std::atomic<std::uint64_t> completed{0};
@@ -123,6 +127,23 @@ struct NodeMetrics {
   std::atomic<std::uint64_t> reorder_gaps{0};
   std::atomic<std::uint64_t> late_completions{0};
   std::atomic<std::uint64_t> orphan_completions{0};
+  // Ingress timestamp (Packet::ingress_ns) of the oldest input of the
+  // invocation currently running on this node; outputs emitted during the
+  // call inherit it. One invocation at a time per node for sync operators
+  // (max_parallelism > 1 only widens the window, never mixes sessions).
+  std::atomic<std::int64_t> current_ingress_ns{0};
+};
+
+// 12 §12.1 SessionMetrics.
+struct SessionMetrics {
+  std::atomic<std::uint64_t> mutations_succeeded{0};
+  std::atomic<std::uint64_t> mutations_failed{0};
+  std::atomic<std::uint64_t> parameter_updates{0};
+  std::atomic<std::uint64_t> retired_topologies{0};
+  std::atomic<std::uint64_t> drain_timeouts{0};
+  LatencyHistogram mutation_publish;  // Apply accepted -> topology swapped
+  LatencyHistogram mutation_retire;   // swap -> last removed node closed
+  LatencyHistogram end_to_end;        // source emit -> sink consume (OBS-1)
 };
 
 // ---------------------------------------------------------------------------

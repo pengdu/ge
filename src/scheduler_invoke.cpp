@@ -93,6 +93,19 @@ PacketSeq FirstSeq(const InputBatch& batch) {
 
 }  // namespace
 
+// OBS-1: remember the oldest ingress of this invocation (outputs inherit
+// it); at a sink the packets end their journey, so sample end-to-end.
+void Scheduler::NoteIngress(NodeRuntime& node, const std::vector<PacketRef>& inputs) {
+  const std::int64_t oldest = OldestIngress(inputs);
+  node.metrics().current_ingress_ns.store(oldest, std::memory_order_relaxed);
+  if (!node.is_sink()) return;
+  const std::int64_t now = SteadyNowNs();
+  for (const PacketRef& p : inputs) {
+    if (!p || p->ingress_ns == 0 || p->is_eos() || p->is_event()) continue;
+    metrics_.end_to_end.Record(static_cast<std::uint64_t>(std::max<std::int64_t>(0, now - p->ingress_ns)));
+  }
+}
+
 // Pops a batch and wakes producers whose block edge just freed a slot
 // (parked data first, then a draining producer's EOS, else a plain re-mark).
 std::optional<InputBatch> Scheduler::AcquireBatch(InputBinding& binding) {
@@ -122,10 +135,11 @@ std::optional<ProcessResult> Scheduler::RunProcessCall(NodeRuntime& node, Proces
   const auto start = std::chrono::steady_clock::now();
   auto r = node.op().Process(req);
   sink.Deactivate();
-  node.metrics().process_ns_total.fetch_add(
-      static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
-      std::memory_order_relaxed);
+  const auto elapsed_ns = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+  node.metrics().process_ns_total.fetch_add(elapsed_ns, std::memory_order_relaxed);
+  node.metrics().process_latency.Record(elapsed_ns);
+  node.metrics().current_ingress_ns.store(0, std::memory_order_relaxed);
   // The batch is consumed: release the payloads *before* EndInvoke returns
   // the slot. Once the slot is free another executor thread may drain and
   // close this node, the sink, and signal all-closed while this frame still
@@ -207,6 +221,7 @@ void Scheduler::RunProcess(NodeRuntime& node, const RuntimeTopology& topo, Input
   req.events = &sink;
   MoveBatchInto(*batch, req.input_ports, req.inputs);
   node.metrics().packets_in.fetch_add(req.inputs.size(), std::memory_order_relaxed);
+  NoteIngress(node, req.inputs);
   if (!RunProcessCall(node, req, sink)) return;
   if (node.held()) return;  // Publish re-marks after Release()
   if (binding.MayBeReady()) {
@@ -261,6 +276,7 @@ void Scheduler::RunAsync(NodeRuntime& node, const std::shared_ptr<const RuntimeT
   req.packet_seq = first_seq;
   MoveBatchInto(*batch, req.input_ports, req.inputs);
   node.metrics().packets_in.fetch_add(req.inputs.size(), std::memory_order_relaxed);
+  NoteIngress(node, req.inputs);
   node.BeginAsync();
   async_.submit(std::move(req));
   node.EndInvoke();

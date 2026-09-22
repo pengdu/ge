@@ -117,6 +117,12 @@ class Engine final {
   [[nodiscard]] Status DestroySession(SessionId id);
   void StopAll(bool fast);
   [[nodiscard]] std::vector<SessionId> Sessions() const;
+  // Live sessions pinned for the caller (a concurrent DestroySession cannot
+  // free them mid-walk). Used by RenderPrometheus.
+  [[nodiscard]] std::vector<std::shared_ptr<Session>> SessionRefs() const;
+  // OBS-2: Prometheus text exposition of every metric (12 §12.1); see
+  // include/ge/cpp/metrics_export.h.
+  [[nodiscard]] std::string RenderPrometheus();
 
   // Watchdog (13 §7.1): drains deadlines, EOS retries, plugin unload
   // completion. Called by the watchdog thread or by the host.

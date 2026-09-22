@@ -103,6 +103,7 @@ add_library (
   src/async_runtime.cpp
   src/operation.cpp
   src/audit_log.cpp
+  src/metrics_export.cpp
   src/resource_ledger.cpp
   src/session.cpp
   src/plugin_operator.cpp

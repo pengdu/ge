@@ -205,6 +205,7 @@ class AsyncRuntime final {
     NodeRuntimeRef node;
     std::shared_ptr<const RuntimeTopology> topology_ref;
     PacketSeq seq = 0;
+    std::int64_t ingress_ns = 0;  // OBS-1: oldest input ingress, inherited by outputs
     std::chrono::steady_clock::time_point enqueued;
     std::optional<std::chrono::steady_clock::time_point> submitted;  // set at flush
     std::chrono::steady_clock::time_point deadline;                  // valid once submitted

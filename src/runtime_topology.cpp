@@ -1,6 +1,7 @@
 #include <ge/cpp/runtime_topology.h>
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 
 namespace ge {
@@ -215,6 +216,20 @@ std::vector<std::string> RuntimeTopology::OutputPorts(NodeId node) const {
 // PacketRouter
 // ---------------------------------------------------------------------------
 
+std::int64_t SteadyNowNs() noexcept {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::int64_t OldestIngress(const std::vector<PacketRef>& inputs) noexcept {
+  std::int64_t oldest = 0;
+  for (const PacketRef& p : inputs) {
+    if (!p || p->ingress_ns == 0) continue;
+    if (oldest == 0 || p->ingress_ns < oldest) oldest = p->ingress_ns;
+  }
+  return oldest;
+}
+
 namespace {
 
 PushOutcome PushEdge(EdgeChannel& edge, const PacketRef& packet, EmitReport* report,
@@ -282,6 +297,15 @@ Result<PacketRef> PacketRouter::Prepare(const RuntimeTopology& topology, NodeRun
   packet.header.topology_version = topology.version();
   packet.header.parameter_version = parameter_version;
   if (packet.header.type_tag == kInvalidTypeTag) packet.header.type_tag = first.type_tag;
+  // OBS-1 end-to-end: a source stamps "now", everything else inherits the
+  // oldest input of the invocation that produced this packet.
+  if (packet.ingress_ns == 0 && !packet.is_eos() && !packet.is_event()) {
+    if (node.is_source()) {
+      packet.ingress_ns = SteadyNowNs();
+    } else {
+      packet.ingress_ns = node.metrics().current_ingress_ns.load(std::memory_order_relaxed);
+    }
+  }
   return std::make_shared<const Packet>(std::move(packet));
 }
 

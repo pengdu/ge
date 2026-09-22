@@ -385,6 +385,15 @@ GE_EXPORT ge_status ge_engine_query_audit_json(ge_engine_handle engine, const ch
   });
 }
 
+GE_EXPORT ge_status ge_engine_render_prometheus(ge_engine_handle engine, char** out_text) {
+  return Guarded([&]() -> ge_status {
+    if (engine == nullptr) return Invalid("engine is null");
+    if (out_text == nullptr) return Invalid("out_text is null");
+    *out_text = Dup(engine->engine->RenderPrometheus());
+    return ge::OkStatus();
+  });
+}
+
 GE_EXPORT ge_status ge_engine_get_capability_json(ge_engine_handle engine, const char* operator_key,
                                                   char** out_json) {
   return Guarded([&]() -> ge_status {

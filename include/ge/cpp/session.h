@@ -206,6 +206,7 @@ class Session final {
 
   // Internal (coordinator).
   [[nodiscard]] Scheduler& scheduler() noexcept { return scheduler_; }
+  [[nodiscard]] const Scheduler& scheduler() const noexcept { return scheduler_; }
   [[nodiscard]] const SessionOptions& options() const noexcept { return options_; }
   // 12 §10 admission (RES-1..4). One lease per session holds the running
   // sum of every live node/edge estimate; Prepare A6 grows it by the

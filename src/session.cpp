@@ -240,6 +240,7 @@ void MutationCoordinator::FailAll(const Merged& batch, const Status& status,
     }
     operations_.Fail(r.operation, status, JsonValue(std::move(d)));
   }
+  session_.scheduler().metrics().mutations_failed.fetch_add(batch.origins.size(), std::memory_order_relaxed);
 }
 
 namespace {
@@ -421,15 +422,22 @@ void MutationCoordinator::Execute(Merged batch) {
   detail["prepare_ms"] = JsonValue(std::chrono::duration<double, std::milli>(t_prepared - t0).count());
   const auto t_publish = std::chrono::steady_clock::now();
   Session* session = &session_;
-  retire.on_complete = [registry, ops, published, detail = std::move(detail), t_publish, session,
+  SessionMetrics* metrics = &session_.scheduler().metrics();
+  retire.on_complete = [registry, ops, published, detail = std::move(detail), t_publish, session, metrics,
                         removed = std::move(prepared->removed)](bool timed_out) {
     // A6 counterpart: the retired version's nodes/edges are closed, their
     // estimate goes back to the ledger.
     session->ReturnResources(removed);
     JsonObject d = detail;
-    d["retire_ms"] = JsonValue(
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_publish).count());
+    const auto retire_ns = std::chrono::steady_clock::now() - t_publish;
+    d["retire_ms"] = JsonValue(std::chrono::duration<double, std::milli>(retire_ns).count());
     if (timed_out) d["drain_timeout_upgraded_to_fast"] = JsonValue(true);
+    // OBS-1 SessionMetrics (12 §12.1).
+    metrics->mutation_retire.Record(
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(retire_ns).count()));
+    metrics->retired_topologies.fetch_add(1, std::memory_order_relaxed);
+    if (timed_out) metrics->drain_timeouts.fetch_add(1, std::memory_order_relaxed);
+    metrics->mutations_succeeded.fetch_add(ops.size(), std::memory_order_relaxed);
     for (const OperationId id : ops) registry->Succeed(id, published, std::nullopt, JsonValue(d));
   };
   for (auto& [node, req] : param_updates) {
@@ -444,6 +452,8 @@ void MutationCoordinator::Execute(Merged batch) {
     return;
   }
   for (const OperationId id : ops) operations_.SetTopologyVersion(id, published);
+  metrics->mutation_publish.Record(static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
   if (events->on_topology_published) events->on_topology_published(published);
 }
 
@@ -761,6 +771,7 @@ Result<ParameterUpdate> Session::SetParameters(std::string_view node_id, JsonVal
   // Fully validated at submit; takes effect at the next packet boundary
   // (12 §5). CTL-5: synchronous result carries the version.
   operations_.Succeed(op, topo->version(), *v);
+  scheduler_.metrics().parameter_updates.fetch_add(1, std::memory_order_relaxed);
   return ParameterUpdate{*v, op};
 }
 

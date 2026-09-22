@@ -154,6 +154,10 @@ class Scheduler final {
   // completion and deadlines. Safe from any thread; cheap when idle.
   void Tick();
   [[nodiscard]] std::size_t pending_retirements() const;
+  // 12 §12.1 SessionMetrics (owned here: the retire / end-to-end samples
+  // are produced on scheduler and AsyncRuntime threads).
+  [[nodiscard]] SessionMetrics& metrics() noexcept { return metrics_; }
+  [[nodiscard]] const SessionMetrics& metrics() const noexcept { return metrics_; }
 
   // 12 §6.1: enqueue if the node can take a slot. Safe from any thread.
   void MarkReady(NodeRuntime& node);
@@ -203,6 +207,7 @@ class Scheduler final {
   bool DrainComplete(const Retired& r) const;  // retire_mutex_ held
   bool CompleteRetired();  // returns true if any entry progressed
   void RetryInjections();
+  void NoteIngress(NodeRuntime& node, const std::vector<PacketRef>& inputs);
   void AttachNodes(const std::vector<NodeRuntimeRef>& nodes);
   // Removes |node| from the live list; true for exactly one caller.
   bool Detach(NodeRuntime& node);
@@ -214,6 +219,7 @@ class Scheduler final {
   ExecutorPool& executor_;
   SchedulerEvents events_;
   AsyncDispatch async_;
+  SessionMetrics metrics_;
   std::atomic<bool> started_{false};
   std::atomic<bool> paused_{false};
   std::atomic<bool> stopping_{false};

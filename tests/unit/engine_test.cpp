@@ -467,6 +467,17 @@ TEST(EngineTest, InlineEngineRunsPluginAsyncOperator) {
   EXPECT_EQ(AsyncMetric(snap, "pass", "reorder_gaps"), 0);
   EXPECT_GT(AsyncMetric(snap, "pass", "batch_count"), 0);
   EXPECT_EQ(e.async_runtime().in_flight(), 0U);
+  // OBS-1: ingress stamps survive the async hop, so every packet the sink
+  // consumed produced an end-to-end sample; async_wait sampled per request.
+  const ge::SessionMetrics& sm = (*s)->scheduler().metrics();
+  EXPECT_EQ(sm.end_to_end.count(), 300U);
+  EXPECT_GT(sm.end_to_end.sum_ns(), 0U);
+  const std::string prom = e.RenderPrometheus();
+  EXPECT_NE(prom.find("ge_node_async_wait_seconds_count{session=\"1\",node=\"pass\",op=\"AsyncPass@1.0.0\"} 300\n"),
+            std::string::npos)
+      << prom;
+  EXPECT_NE(prom.find("ge_node_async_completed_total{session=\"1\",node=\"pass\",op=\"AsyncPass@1.0.0\"} 300\n"),
+            std::string::npos);
 }
 
 // Same graph on real threads: executor workers submit, the AsyncRuntime
@@ -729,6 +740,69 @@ TEST(CApiTest, SessionCreateFailuresAndDestroyedHandles) {
   ASSERT_TRUE(RunToStop(e.cpp(), cpp));
   ASSERT_EQ(ge_engine_get_operation_json(e.h, op, &json).code, GE_STATUS_OK);
   EXPECT_NE(TakeString(e.h, json).find("\"succeeded\""), std::string::npos);
+  ge_session_destroy(s);
+}
+
+// OBS-1/2: the Prometheus exposition covers engine, ledger, session, node
+// and edge metrics; end-to-end latency is sampled at the sink and mutation
+// counters/histograms move with a hot update and a patch.
+TEST(CApiTest, RenderPrometheusExposesAllLevels) {
+  CEngine e;
+  ge_plugin_id v1 = 0;
+  const std::string good = (PluginDir() / "sample_plugin.json").string();
+  ASSERT_EQ(ge_engine_load_plugin(e.h, good.c_str(), &v1).code, GE_STATUS_OK);
+  char* text = nullptr;
+  EXPECT_EQ(ge_engine_render_prometheus(nullptr, &text).code, GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ge_engine_render_prometheus(e.h, nullptr).code, GE_STATUS_INVALID_ARGUMENT);
+  ASSERT_EQ(ge_engine_render_prometheus(e.h, &text).code, GE_STATUS_OK);
+  std::string empty = TakeString(e.h, text);
+  EXPECT_NE(empty.find("ge_engine_sessions 0\n"), std::string::npos);
+  EXPECT_NE(empty.find("# TYPE ge_resource_capacity gauge\n"), std::string::npos);
+  EXPECT_NE(empty.find("ge_resource_capacity{kind=\"cpu_threads\",device=\"-1\"}"), std::string::npos);
+  EXPECT_NE(empty.find("ge_engine_audit_records_total 1\n"), std::string::npos);  // plugin.load
+
+  ge_session_handle s = nullptr;
+  ASSERT_EQ(ge_session_create(e.h, GraphJson("m", 30).c_str(), nullptr, &s, nullptr).code, GE_STATUS_OK);
+  ASSERT_EQ(ge_session_start(s).code, GE_STATUS_OK);
+  ge::Session* cpp = e.cpp().FindSession(1);
+  ASSERT_NE(cpp, nullptr);
+  RunSome(e.cpp(), cpp, 5);
+  ge_parameter_version pv = 0;
+  ASSERT_EQ(ge_session_set_node_parameters(s, cpp->current_topology()->FindNode("pass")->id(), R"({"gain":2})",
+                                           nullptr, &pv, nullptr).code,
+            GE_STATUS_OK);
+  const std::string patch =
+      ge::GraphSpecParser::ToJson(ge::Mutation().SetNodeOptions("pass", ge::JsonValue(ge::JsonObject{{"gain", ge::JsonValue(3)}})).Build())
+          .Serialize();
+  ge_operation_id op = 0;
+  ASSERT_EQ(ge_session_apply_patch(s, patch.c_str(), nullptr, &op).code, GE_STATUS_OK);
+  ASSERT_TRUE(RunToStop(e.cpp(), cpp));
+
+  ASSERT_EQ(ge_engine_render_prometheus(e.h, &text).code, GE_STATUS_OK);
+  const std::string out = TakeString(e.h, text);
+  auto has = [&](const char* needle) { return out.find(needle) != std::string::npos; };
+  SCOPED_TRACE(out);
+  EXPECT_TRUE(has("ge_engine_sessions 1\n"));
+  EXPECT_TRUE(has("ge_engine_executor_threads 0\n"));
+  EXPECT_TRUE(has("ge_session_state{session=\"1\"} 6\n"));  // kStopped
+  EXPECT_TRUE(has("ge_session_parameter_updates_total{session=\"1\"} 1\n"));
+  EXPECT_TRUE(has("ge_session_mutations_succeeded_total{session=\"1\"} 1\n"));
+  EXPECT_TRUE(has("ge_session_mutations_failed_total{session=\"1\"} 0\n"));
+  EXPECT_TRUE(has("ge_session_retired_topologies_total{session=\"1\"} 1\n"));
+  EXPECT_TRUE(has("ge_session_mutation_publish_seconds_count{session=\"1\"} 1\n"));
+  EXPECT_TRUE(has("ge_session_mutation_retire_seconds_count{session=\"1\"} 1\n"));
+  EXPECT_TRUE(has("ge_session_end_to_end_seconds_count{session=\"1\"} 30\n")) << out;
+  EXPECT_TRUE(has("ge_session_end_to_end_seconds_bucket{session=\"1\",le=\"+Inf\"} 30\n"));
+  EXPECT_TRUE(has("ge_node_packets_in_total{session=\"1\",node=\"sink\",op=\"Sink@1.0.0\"} 30\n"));
+  EXPECT_TRUE(has("ge_node_packets_out_total{session=\"1\",node=\"src\",op=\"Src@1.0.0\"} 30\n"));
+  EXPECT_TRUE(has("ge_node_process_seconds_count{session=\"1\",node=\"pass\",op=\"Pass@1.0.0\"} "));
+  EXPECT_TRUE(has("ge_edge_pushed_total{session=\"1\",edge=\"e1\"} 31\n"));  // 30 data + EOS
+  EXPECT_TRUE(has("ge_edge_queue_depth{session=\"1\",edge=\"e0\"} 0\n"));
+  EXPECT_TRUE(has("# TYPE ge_node_process_seconds histogram\n"));
+  // Every metric name is declared exactly once.
+  EXPECT_EQ(out.find("# TYPE ge_node_packets_in_total counter"), out.rfind("# TYPE ge_node_packets_in_total counter"));
+  // C++ entry point is the same renderer.
+  EXPECT_EQ(e.cpp().RenderPrometheus(), out);
   ge_session_destroy(s);
 }
 
