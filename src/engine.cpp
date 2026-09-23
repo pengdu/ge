@@ -1,13 +1,15 @@
 #include <ge/cpp/engine.h>
 
+#include <ge/cpp/scheduler.h>
 #include <ge/cpp/graph_spec_json.h>
 #include <ge/cpp/metrics_export.h>
 
 #include <algorithm>
 #include <charconv>
-#include <set>
 
 #include "clock.h"
+#include "plugin_lifecycle_service.h"
+#include "session_manager.h"
 
 namespace ge {
 
@@ -290,6 +292,31 @@ Engine::Engine(EngineConfig config)
   AsyncOptions ao = config_.async;
   ao.worker_thread = config_.async_worker_thread.value_or(config_.cpu_threads != 0);
   async_ = std::make_unique<AsyncRuntime>(ao);
+
+  PluginLifecycleServices ls;
+  ls.plugins = plugins_.get();
+  ls.factory = &factory_;
+  ls.operations = &operations_;
+  ls.audit = &audit_;
+  ls.executor = executor_.get();
+  ls.async = async_.get();
+  ls.publish_event = [this](SessionId session, std::string type, Severity severity, NodeId node,
+                            JsonValue detail) {
+    PublishSessionEvent(session, std::move(type), severity, node, std::move(detail));
+  };
+  lifecycle_ = std::make_unique<PluginLifecycleService>(std::move(ls), config_);
+  SessionManagerServices ss;
+  ss.factory = &factory_;
+  ss.executor = executor_.get();
+  ss.operations = &operations_;
+  ss.async = async_.get();
+  ss.ledger = ledger_.get();
+  ss.operator_generation = [this] { return plugins_->operator_generation(); };
+  sessions_ = std::make_unique<SessionManager>(
+      std::move(ss), config_,
+      [this](SessionId id, CallerContext caller) { return MakeSessionEvents(id, std::move(caller)); });
+  lifecycle_->set_sessions(sessions_.get());
+
   if (config_.watchdog_thread) watchdog_ = std::thread([this] { WatchdogLoop(); });
 }
 
@@ -301,10 +328,7 @@ Engine::~Engine() {
   }
   if (watchdog_.joinable()) watchdog_.join();
   StopAll(true);
-  {
-    std::lock_guard lock(sessions_mutex_);
-    sessions_.clear();  // 13 §7.3: sessions before shared services
-  }
+  sessions_->Clear();  // 13 §7.3: sessions before shared services
   async_.reset();
   executor_->Stop();
   events_->Flush();
@@ -322,19 +346,14 @@ void Engine::WatchdogLoop() {
 }
 
 void Engine::Tick() {
-  std::vector<std::shared_ptr<Session>> sessions;
-  {
-    std::lock_guard lock(sessions_mutex_);
-    for (auto& [id, s] : sessions_) sessions.push_back(s);
-  }
-  for (const auto& s : sessions) s->Tick();
+  sessions_->TickAll();
   if (!async_->options().worker_thread) (void)async_->Pump();
   if (config_.cpu_threads == 0) (void)executor_->RunPending();
-  CompletePendingUnloads();
+  lifecycle_->CompletePendingUnloads();
 }
 
-void Engine::PublishSessionEvent(SessionId session, std::string type, Severity severity,
-                                 NodeId node, JsonValue detail) {
+void Engine::PublishSessionEvent(SessionId session, std::string type, Severity severity, NodeId node,
+                                 JsonValue detail) {
   Event ev;
   ev.type = std::move(type);
   ev.severity = severity;
@@ -350,243 +369,27 @@ void Engine::PublishSessionEvent(SessionId session, std::string type, Severity s
 // ---------------------------------------------------------------------------
 
 Result<PluginInfo> Engine::LoadPlugin(const std::filesystem::path& manifest) {
-  auto r = plugins_->Load(manifest);
-  AuditRecord a;
-  a.operation = "plugin.load";
-  a.result = r.ok() ? GE_STATUS_OK : r.status().code();
-  JsonObject d;
-  d["manifest"] = JsonValue(manifest.string());
-  if (r.ok()) {
-    a.target = "plugin:" + std::to_string(r->id);
-    d["plugin"] = JsonValue(r->id);
-    d["plugin_id"] = JsonValue(r->plugin_id);
-    d["state"] = JsonValue(ToString(r->state));
-    if (r->state == PluginState::kRejected) {
-      a.result = r->rejection.code();
-      a.message = r->rejection.message();
-    }
-  } else {
-    a.target = "engine";
-    a.message = r.status().message();
-  }
-  a.digest = JsonValue(std::move(d));
-  audit_.Append(std::move(a));
-  return r;
+  return lifecycle_->Load(manifest);
 }
 
-Result<OperationId> Engine::RetirePlugin(PluginId id, RetirePluginOptions options,
-                                         CallerContext caller) {
-  const auto info = plugins_->Get(id);
-  if (!info) return Status::NotFound("plugin " + std::to_string(id));
-  const OperationId op = operations_.Create(
-      "plugin.retire", 0, std::move(caller),
-      JsonValue(JsonObject{{"plugin", JsonValue(id)},
-                           {"physical", JsonValue(options.request_physical_unload)}}));
-  if (Status s = plugins_->Retire(id); !s.ok()) {
-    operations_.Fail(op, s);
-    return op;
-  }
-  operations_.SetRunning(op);
-  {
-    std::lock_guard lock(retire_mutex_);
-    pending_retires_.push_back(PendingRetire{id, op, options.request_physical_unload});
-  }
-  CompletePendingUnloads();
-  return op;
+Result<OperationId> Engine::RetirePlugin(PluginId id, RetirePluginOptions options, CallerContext caller) {
+  return lifecycle_->Retire(id, options, std::move(caller));
 }
 
-void Engine::CompletePendingUnloads() {
-  std::lock_guard pass(unload_pass_mutex_);
-  std::vector<PendingRetire> pending;
-  {
-    std::lock_guard lock(retire_mutex_);
-    pending.swap(pending_retires_);
-  }
-  std::vector<PendingRetire> keep;
-  for (const PendingRetire& r : pending) {
-    const Status logical = plugins_->LogicalUnload(r.plugin);
-    if (logical.code() == GE_STATUS_WOULD_BLOCK) {
-      keep.push_back(r);
-      continue;
-    }
-    if (!logical.ok()) {
-      operations_.Fail(r.operation, logical);
-      continue;
-    }
-    JsonObject d;
-    d["logically_unloaded"] = JsonValue(true);
-    if (r.physical) {
-      const Status physical = plugins_->PhysicalUnload(r.plugin);
-      d["physically_unloaded"] = JsonValue(physical.ok());
-      if (!physical.ok()) {
-        // 12 §9.4: logical unload stands; the physical refusal is the result.
-        d["physical_unload"] = JsonValue(JsonObject{{"code", JsonValue(Status::CodeName(physical.code()))},
-                                                    {"message", JsonValue(physical.message())}});
-        operations_.Fail(r.operation, physical, JsonValue(std::move(d)));
-        continue;
-      }
-    }
-    operations_.Succeed(r.operation, std::nullopt, std::nullopt, JsonValue(std::move(d)));
-  }
-  std::lock_guard lock(retire_mutex_);
-  pending_retires_.insert(pending_retires_.end(), keep.begin(), keep.end());
+Result<UpgradeReport> Engine::UpgradeOperator(const OperatorKey& old_key, const OperatorKey& new_key,
+                                              CallerContext caller) {
+  return lifecycle_->UpgradeOperator(old_key, new_key, std::move(caller));
 }
 
 Result<CapabilityDescriptor> Engine::GetCapability(const OperatorKey& key) const {
-  const CapabilityDescriptor* cap = factory_.Describe(key);
-  if (cap == nullptr) return Status::NotFound("operator '" + key.ToString() + "' not found");
-  return *cap;
-}
-
-// 12 §9.3
-Result<UpgradeReport> Engine::UpgradeOperator(const OperatorKey& old_key, const OperatorKey& new_key,
-                                              CallerContext caller) {
-  if (old_key == new_key) return Status::InvalidArgument("old and new operator keys are identical");
-  const auto old_plugin = plugins_->Resolve(old_key);
-  if (!old_plugin) return Status::NotFound("operator '" + old_key.ToString() + "' not found");
-  const auto new_plugin = plugins_->Resolve(new_key);
-  if (!new_plugin) return Status::NotFound("operator '" + new_key.ToString() + "' not found");
-  const auto new_info = plugins_->Get(*new_plugin);
-  if (!new_info || (new_info->state != PluginState::kRegistered && new_info->state != PluginState::kActive)) {
-    return Status::PluginRetired("replacement plugin is not active");
-  }
-  UpgradeReport report;
-  report.old_plugin = *old_plugin;
-  report.new_plugin = *new_plugin;
-  report.operation = operations_.Create(
-      "plugin.upgrade_operator", 0, caller,
-      JsonValue(JsonObject{{"old", JsonValue(old_key.ToString())}, {"new", JsonValue(new_key.ToString())}}));
-  operations_.SetRunning(report.operation);
-
-  // 1. old -> Retiring.
-  if (Status s = plugins_->Retire(*old_plugin); !s.ok()) {
-    operations_.Fail(report.operation, s);
-    return s;
-  }
-  // 2. snapshot references grouped by session (current topologies only:
-  // retired versions finish on their own).
-  std::map<SessionId, std::set<std::string>> by_session;
-  {
-    std::lock_guard lock(sessions_mutex_);
-    for (auto& [id, s] : sessions_) {
-      const std::shared_ptr<RuntimeTopology> topo = s->current_topology();
-      for (const NodeRuntimeRef& n : topo->nodes()) {
-        if (n->operator_key() == old_key) by_session[id].insert(n->external_id());
-      }
-    }
-  }
-  // 3. one ReplaceNode mutation per session.
-  for (const auto& [sid, nodes] : by_session) {
-    SessionUpgradeResult r;
-    r.session = sid;
-    r.nodes.assign(nodes.begin(), nodes.end());
-    Session* s = FindSession(sid);
-    if (s == nullptr) {
-      r.result = Status::NotFound("session vanished");
-      report.sessions.push_back(std::move(r));
-      continue;
-    }
-    Mutation m;
-    for (const std::string& node : nodes) m.ReplaceNode(node, new_key);
-    auto op = s->Apply(m.Build(), caller);
-    if (!op.ok()) {
-      r.result = op.status();
-      report.sessions.push_back(std::move(r));
-      continue;
-    }
-    r.operation = *op;
-    // Inline executor: publish now, before the shared queue advances any
-    // other session's stream past the point where it could still mutate.
-    if (config_.cpu_threads == 0) (void)s->PumpMutations();
-    report.sessions.push_back(std::move(r));
-  }
-  // 4. collect per-session results (wait bounded by drain timeout + slack).
-  for (SessionUpgradeResult& r : report.sessions) {
-    if (r.operation == 0) continue;
-    Session* s = FindSession(r.session);
-    const auto timeout = (s != nullptr ? s->options().drain_timeout : config_.default_drain_timeout) +
-                         std::chrono::milliseconds(5000);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::optional<OperationRecord> rec;
-    for (;;) {
-      if (config_.cpu_threads == 0 && s != nullptr) {
-        (void)s->PumpMutations();
-        (void)executor_->RunPending();
-        if (!async_->options().worker_thread) (void)async_->Pump();
-        s->Tick();
-      }
-      rec = operations_.Wait(r.operation, std::chrono::milliseconds(config_.cpu_threads == 0 ? 1 : 50));
-      if (rec) break;
-      if (std::chrono::steady_clock::now() >= deadline) break;
-    }
-    if (!rec) {
-      r.result = Status::Internal("replace mutation did not finish in time");
-    } else if (rec->state == OperationState::kSucceeded) {
-      r.result = Status::Ok();
-    } else if (rec->state == OperationState::kCancelled) {
-      r.result = Status::Cancelled(rec->result.message());
-    } else {
-      r.result = rec->result;
-    }
-  }
-  // 5/6. all succeeded and references == 0 -> logical unload; otherwise old
-  // stays retiring (no rollback of succeeded sessions).
-  if (report.all_succeeded()) {
-    const Status s = plugins_->LogicalUnload(*old_plugin);
-    report.unloaded = s.ok();
-    if (s.code() == GE_STATUS_WOULD_BLOCK) {
-      std::lock_guard lock(retire_mutex_);
-      pending_retires_.push_back(PendingRetire{*old_plugin, 0, false});
-    }
-  }
-  JsonValue detail = report.ToJson();
-  if (report.all_succeeded()) {
-    operations_.Succeed(report.operation, std::nullopt, std::nullopt, detail);
-  } else {
-    std::size_t failed = 0;
-    for (const SessionUpgradeResult& r : report.sessions) {
-      if (!r.result.ok()) ++failed;
-    }
-    operations_.Fail(report.operation,
-                     Status(GE_STATUS_INTERNAL,
-                            std::to_string(failed) + " of " + std::to_string(report.sessions.size()) +
-                                " sessions failed to upgrade",
-                            false),
-                     detail);
-  }
-  PublishSessionEvent(0, "plugin_state", Severity::kInfo, 0, detail);
-  return report;
+  return lifecycle_->GetCapability(key);
 }
 
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
-Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext caller,
-                                       OperationId* out_operation) {
-  return CreateSession(spec, std::move(caller), out_operation, nullptr);
-}
-
-Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext caller, OperationId* out_operation,
-                                       std::shared_ptr<const ValidatedGraph> prevalidated) {
-  std::lock_guard lock(sessions_mutex_);
-  const SessionId sid = next_session_id_++;
-  // The full spec is the digest (node options may carry URLs / credentials:
-  // AuditLog redacts them, AUD-2).
-  const OperationId op = operations_.Create(
-      "session.create", sid, caller,
-      JsonValue(JsonObject{{"graph", JsonValue(spec.name())}, {"spec", GraphSpecParser::ToJson(spec)}}));
-  if (out_operation != nullptr) *out_operation = op;
-  operations_.SetRunning(op);
-  SessionOptions so;
-  so.id = sid;
-  so.drain_timeout = config_.default_drain_timeout;
-  so.coordinator_thread = config_.cpu_threads != 0;
-  so.async_runtime = async_.get();
-  so.resource_ledger = ledger_.get();
-  so.reject_unbudgeted_edges = config_.reject_unbudgeted_edges;
-  so.prevalidated = std::move(prevalidated);
-  if (const auto b = spec.options().extra.GetBool("batching")) so.batching = *b;
+SessionEvents Engine::MakeSessionEvents(SessionId sid, CallerContext caller) {
   SessionEvents ev;
   ev.on_state_changed = [this, sid](SessionState from, SessionState to) {
     PublishSessionEvent(sid, "session_state", Severity::kInfo, 0,
@@ -631,126 +434,44 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
     }
     PublishSessionEvent(sid, std::move(type), sev, node.id(), std::move(detail));
   };
-  auto r = Session::Create(spec, factory_, *executor_, operations_, so, std::move(ev));
-  if (!r.ok()) {
-    operations_.Fail(op, r.status());
-    return r.status();
-  }
-  Session* raw = r->get();
-  sessions_[sid] = std::shared_ptr<Session>(std::move(*r));
-  operations_.Succeed(op, raw->topology_version());
-  return raw;
+  return ev;
 }
 
-Status Engine::PrevalidateTemplate(GraphTemplate& tmpl) {
-  return tmpl.Prevalidate([this](const OperatorKey& k) { return factory_.Describe(k); }, operator_generation());
+Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext caller,
+                                       OperationId* out_operation) {
+  return sessions_->Create(spec, std::move(caller), out_operation, nullptr);
 }
+
+Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext caller, OperationId* out_operation,
+                                       std::shared_ptr<const ValidatedGraph> prevalidated) {
+  return sessions_->Create(spec, std::move(caller), out_operation, std::move(prevalidated));
+}
+
+Status Engine::PrevalidateTemplate(GraphTemplate& tmpl) { return sessions_->PrevalidateTemplate(tmpl); }
 
 Result<Session*> Engine::CreateSession(const GraphTemplate& tmpl, const JsonValue& arguments,
                                        std::string_view instance_name, CallerContext caller,
                                        OperationId* out_operation) {
-  Result<GraphSpec> spec = tmpl.Instantiate(arguments, instance_name);
-  if (!spec.ok()) return spec.status();
-  // The cached ValidatedGraph encodes the capabilities of the operator set
-  // that was loaded when Prevalidate() ran. A plugin loaded/retired since
-  // then invalidates it: revalidate here rather than negotiate against a
-  // stale descriptor set.
-  if (!tmpl.validated_for(operator_generation())) {
-    const auto resolver = [this](const OperatorKey& k) { return factory_.Describe(k); };
-    Result<ValidatedGraph> refreshed = GraphValidator(resolver).Validate(tmpl.skeleton());
-    if (!refreshed.ok()) return refreshed.status();
-    return CreateSession(*spec, std::move(caller), out_operation,
-                         std::make_shared<const ValidatedGraph>(std::move(*refreshed)));
-  }
-  return CreateSession(*spec, std::move(caller), out_operation, tmpl.validated());
+  return sessions_->CreateFromTemplate(tmpl, arguments, instance_name, std::move(caller), out_operation);
 }
 
-Session* Engine::FindSession(SessionId id) const {
-  std::lock_guard lock(sessions_mutex_);
-  const auto it = sessions_.find(id);
-  return it == sessions_.end() ? nullptr : it->second.get();
-}
+Session* Engine::FindSession(SessionId id) const { return sessions_->Find(id); }
 
-std::shared_ptr<Session> Engine::FindSessionShared(SessionId id) const {
-  std::lock_guard lock(sessions_mutex_);
-  const auto it = sessions_.find(id);
-  return it == sessions_.end() ? nullptr : it->second;
-}
+std::shared_ptr<Session> Engine::FindSessionShared(SessionId id) const { return sessions_->FindShared(id); }
 
 Status Engine::DestroySession(SessionId id) {
-  std::shared_ptr<Session> s;
-  {
-    std::lock_guard lock(sessions_mutex_);
-    const auto it = sessions_.find(id);
-    if (it == sessions_.end()) return Status::NotFound("session " + std::to_string(id));
-    s = std::move(it->second);
-    sessions_.erase(it);
-  }
-  const SessionState st = s->state();
-  if (st != SessionState::kStopped && st != SessionState::kCreated) {
-    (void)s->Stop(true);
-    if (config_.cpu_threads == 0) {
-      for (int i = 0; i < 100000 && !s->WaitStopped(std::chrono::milliseconds(0)); ++i) {
-        (void)executor_->RunPending();
-        if (!async_->options().worker_thread) (void)async_->Pump();
-        s->Tick();
-      }
-    } else {
-      (void)s->WaitStopped(std::chrono::milliseconds(5000));
-    }
-  }
-  // The watchdog's Tick() may still hold a snapshot reference; the plugin
-  // leases are only released by ~Session, and CompletePendingUnloads()
-  // below must observe that, so wait for the last reference to drop.
-  std::weak_ptr<Session> weak = s;
-  s.reset();
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!weak.expired() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  CompletePendingUnloads();
-  return Status::Ok();
+  const Status s = sessions_->Destroy(id);
+  // Destroy only returns once the last session reference dropped, so the
+  // leases are back and any retire waiting on them can finish now.
+  if (s.ok()) lifecycle_->CompletePendingUnloads();
+  return s;
 }
 
-void Engine::StopAll(bool fast) {
-  std::vector<std::shared_ptr<Session>> sessions;
-  {
-    std::lock_guard lock(sessions_mutex_);
-    for (auto& [id, s] : sessions_) sessions.push_back(s);
-  }
-  for (const auto& s : sessions) {
-    const SessionState st = s->state();
-    if (st == SessionState::kStopped || st == SessionState::kCreated) continue;
-    (void)s->Stop(fast);
-  }
-  for (const auto& s : sessions) {
-    if (config_.cpu_threads == 0) {
-      for (int i = 0; i < 100000 && !s->WaitStopped(std::chrono::milliseconds(0)); ++i) {
-        (void)s->PumpMutations();
-        (void)executor_->RunPending();
-        if (!async_->options().worker_thread) (void)async_->Pump();
-        s->Tick();
-      }
-    } else {
-      (void)s->WaitStopped(std::chrono::milliseconds(5000));
-    }
-  }
-}
+void Engine::StopAll(bool fast) { sessions_->StopAll(fast); }
 
-std::vector<SessionId> Engine::Sessions() const {
-  std::lock_guard lock(sessions_mutex_);
-  std::vector<SessionId> out;
-  for (const auto& [id, s] : sessions_) out.push_back(id);
-  return out;
-}
+std::vector<SessionId> Engine::Sessions() const { return sessions_->Ids(); }
 
-std::vector<std::shared_ptr<Session>> Engine::SessionRefs() const {
-  std::lock_guard lock(sessions_mutex_);
-  std::vector<std::shared_ptr<Session>> out;
-  out.reserve(sessions_.size());
-  for (const auto& [id, s] : sessions_) out.push_back(s);
-  return out;
-}
+std::vector<std::shared_ptr<Session>> Engine::SessionRefs() const { return sessions_->Refs(); }
 
 std::string Engine::RenderPrometheus() { return ge::RenderPrometheus(*this); }
 

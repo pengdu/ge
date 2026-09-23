@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ge/c/ge_engine.h>
@@ -419,6 +420,66 @@ TEST(EngineTest, DestructorStopsRunningSessionsAndReleasesPlugins) {
     EXPECT_EQ((*s)->state(), ge::SessionState::kRunning);
   }
   EXPECT_EQ(pool->stats().live_buffers, 0U);
+}
+
+// Lock-order canary ahead of the Engine split: today the only legal order is
+// Engine::sessions_mutex_ -> Session::lease_mutex_ -> ResourceLedger::mutex_
+// (create/destroy hold the first, mutations hold the second, the ledger never
+// calls back out). Hammer the three paths that take them in combination --
+// session create/destroy (engine map + ledger), mutation-driven
+// reserve/return (lease + ledger), and RenderPrometheus (engine map + lease
+// + ledger reads) -- so a future refactor that inverts an edge deadlocks or
+// trips TSan here instead of in production.
+TEST(EngineTest, SessionLedgerAndMetricsPathsDoNotDeadlock) {
+  ge::EngineConfig c = InlineConfig();
+  c.cpu_threads = 2;
+  c.watchdog_thread = true;
+  c.watchdog_period = std::chrono::milliseconds(1);
+  auto engine = ge::Engine::Create(c);
+  ASSERT_TRUE(engine.ok());
+  ge::Engine& e = **engine;
+  ASSERT_TRUE(e.LoadPlugin(PluginDir() / "sample_plugin.json").ok());
+  ASSERT_NE(e.resource_ledger(), nullptr);
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> churned{0};
+  // 1. create/start/destroy churn: sessions_mutex_ then ledger (admission),
+  // then ~Session returning the lease.
+  std::thread churn([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      auto s = e.CreateSession(Linear("churn", 50));
+      if (!s.ok()) continue;
+      (void)(*s)->Start();
+      (void)e.DestroySession((*s)->id());
+      churned.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  // 2. metrics walk: sessions_mutex_ (SessionRefs), then every session's
+  // lease_mutex_ (HeldResources) and the ledger mutex (Usage).
+  std::thread metrics([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      (void)e.RenderPrometheus();
+    }
+  });
+  // 3. parameter churn + snapshots on a long-lived session: Snapshot walks
+  // lease_mutex_ (HeldResources) while the churn thread is inside
+  // sessions_mutex_ -> ledger and the metrics thread walks all three.
+  auto held = e.CreateSession(Linear("held", 1 << 20));
+  ASSERT_TRUE(held.ok()) << held.status().ToString();
+  ASSERT_TRUE((*held)->Start().ok());
+  const ge::SessionId held_id = (*held)->id();
+  for (int i = 0; i < 50; ++i) {
+    std::shared_ptr<ge::Session> s = e.FindSessionShared(held_id);
+    ASSERT_NE(s, nullptr);
+    (void)s->SetParameters("pass", ge::JsonValue(ge::JsonObject{{"gain", ge::JsonValue(i)}}));
+    (void)s->Snapshot();  // lease_mutex_ via HeldResources
+  }
+  stop.store(true, std::memory_order_relaxed);
+  churn.join();
+  metrics.join();
+  EXPECT_GT(churned.load(), 0);
+  ASSERT_TRUE(e.DestroySession(held_id).ok());
+  EXPECT_EQ(e.resource_ledger()->live_leases(), 0U);
 }
 
 TEST(EngineTest, ThreadedEngineRunsPluginGraph) {

@@ -123,6 +123,8 @@ add_library (
   src/plugin_registry.cpp
   src/event_bus.cpp
   src/engine.cpp
+  src/session_manager.cpp
+  src/plugin_lifecycle_service.cpp
   src/c_api.cpp)
 target_include_directories (
   ge_core

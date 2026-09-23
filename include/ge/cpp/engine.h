@@ -29,6 +29,9 @@
 
 namespace ge {
 
+class SessionManager;
+class PluginLifecycleService;
+
 struct EngineConfig {
   std::vector<std::filesystem::path> plugin_search_paths;
   std::map<std::string, std::string> host_dependencies;
@@ -81,6 +84,12 @@ struct RetirePluginOptions {
   bool request_physical_unload = false;
 };
 
+// Assembly root: owns the shared services (pool, ledger, events, plugin
+// registry, executor, async runtime) and the two lifecycle services, and
+// drives the watchdog. Everything it exposes is either a service accessor or
+// a thin forward -- session admission lives in SessionManager, plugin
+// lifecycle in PluginLifecycleService, so this file changes when the
+// *composition* changes, not when either policy does.
 class Engine final {
  public:
   [[nodiscard]] static Result<std::unique_ptr<Engine>> Create(EngineConfig config);
@@ -156,13 +165,10 @@ class Engine final {
   void WatchdogLoop();
   void PublishSessionEvent(SessionId session, std::string type, Severity severity, NodeId node,
                            JsonValue detail);
-  void CompletePendingUnloads();
-
-  struct PendingRetire {
-    PluginId plugin = 0;
-    OperationId operation = 0;
-    bool physical = false;
-  };
+  // Session observation hooks are engine policy (events + audit), so the
+  // engine supplies them to SessionManager rather than the manager knowing
+  // about either.
+  [[nodiscard]] SessionEvents MakeSessionEvents(SessionId id, CallerContext caller);
 
   EngineConfig config_;
   std::shared_ptr<HostBufferPool> pool_;
@@ -174,19 +180,10 @@ class Engine final {
   std::unique_ptr<AsyncRuntime> async_;
   OperationRegistry operations_;
   AuditLog audit_;
-  // shared_ptr, not unique_ptr: Tick()/StopAll() snapshot the sessions and
-  // call into them outside sessions_mutex_, so a concurrent DestroySession
-  // must not free a session the watchdog is still ticking (TSan, Linux CI).
-  mutable std::mutex sessions_mutex_;
-  std::map<SessionId, std::shared_ptr<Session>> sessions_;
-  SessionId next_session_id_ = 1;
-  std::mutex retire_mutex_;
-  std::vector<PendingRetire> pending_retires_;
-  // Serialises CompletePendingUnloads() between the watchdog and callers
-  // (DestroySession / UpgradeOperator) so a caller that returns has seen
-  // every unload that was possible at that point, not one the watchdog
-  // was still working on.
-  std::mutex unload_pass_mutex_;
+  // Declared after the services they borrow: destroyed first, so their
+  // destructors see a live registry/executor.
+  std::unique_ptr<PluginLifecycleService> lifecycle_;
+  std::unique_ptr<SessionManager> sessions_;
   std::thread watchdog_;
   std::mutex watchdog_mutex_;
   std::condition_variable watchdog_cv_;
