@@ -207,3 +207,14 @@ add_executable (ge_bench bench/ge_bench.cpp)
 target_link_libraries (ge_bench PRIVATE ge_core ge_test_flags)
 add_test (NAME ge_bench COMMAND ge_bench --iterations 8 --packets 5000 --json)
 set_tests_properties (ge_bench PROPERTIES LABELS bench)
+
+# Docs/13 class catalogue vs. code drift (W-2): every class named in the
+# 7.1/7.2/7.2a tables must exist under include/ or src/. Keeps the catalogue
+# a reliable navigation surface for humans and search tools.
+find_package (Python3 COMPONENTS Interpreter QUIET)
+if (Python3_FOUND)
+  add_test (NAME ge_docs_symbols
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/scripts/check_docs_symbols.py")
+  set_tests_properties (ge_docs_symbols PROPERTIES LABELS docs
+                         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif ()
