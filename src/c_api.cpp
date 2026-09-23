@@ -375,22 +375,22 @@ GE_EXPORT ge_status ge_session_subscribe_events(ge_session_handle session, const
     std::shared_ptr<ge::Engine> e = LiveEngine(session->owner);
     if (e == nullptr) return Invalid("engine is destroyed");
     const ge::SubscriptionId id = e->events().Subscribe(
-        std::move(f), [callback, user_data](const ge::Event& e) {
-          const std::string detail = e.detail.Serialize();
+        std::move(f), [callback, user_data](const ge::Event& event) {
+          const std::string detail = event.detail.Serialize();
           ge_event ev{};
           ev.header.struct_size = sizeof(ge_event);
           ev.header.abi_major = GE_ABI_MAJOR;
-          ev.event_id = e.event_id;
-          ev.kind = e.kind == ge::EventKind::kDataPlane ? GE_EVENT_DATA_PLANE : GE_EVENT_OBSERVATION;
-          ev.type = e.type.c_str();
-          ev.severity = static_cast<ge_severity>(e.severity);
-          ev.session_id = e.session;
-          ev.source_node_id = e.source_node;
-          ev.timestamp_ns = e.timestamp_ns;
-          ev.has_seq = e.seq ? 1 : 0;
-          ev.seq = e.seq.value_or(0);
-          ev.has_pts = e.pts_ns ? 1 : 0;
-          ev.pts_ns = e.pts_ns.value_or(0);
+          ev.event_id = event.event_id;
+          ev.kind = event.kind == ge::EventKind::kDataPlane ? GE_EVENT_DATA_PLANE : GE_EVENT_OBSERVATION;
+          ev.type = event.type.c_str();
+          ev.severity = static_cast<ge_severity>(event.severity);
+          ev.session_id = event.session;
+          ev.source_node_id = event.source_node;
+          ev.timestamp_ns = event.timestamp_ns;
+          ev.has_seq = event.seq ? 1 : 0;
+          ev.seq = event.seq.value_or(0);
+          ev.has_pts = event.pts_ns ? 1 : 0;
+          ev.pts_ns = event.pts_ns.value_or(0);
           ev.detail_json = detail.c_str();
           callback(&ev, user_data);
         });

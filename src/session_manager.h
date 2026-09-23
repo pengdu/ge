@@ -1,7 +1,7 @@
 #ifndef GE_SRC_SESSION_MANAGER_H_
 #define GE_SRC_SESSION_MANAGER_H_
 
-#include <ge/cpp/engine.h>
+#include <ge/cpp/engine_config.h>
 #include <ge/cpp/graph_template.h>
 #include <ge/cpp/session.h>
 

@@ -7,6 +7,7 @@
 #include "session_manager.h"
 
 #include <algorithm>
+#include <cassert>
 #include <map>
 #include <set>
 #include <string>
@@ -14,7 +15,12 @@
 namespace ge {
 
 PluginLifecycleService::PluginLifecycleService(PluginLifecycleServices services, const EngineConfig& config)
-    : services_(std::move(services)), config_(config) {}
+    : services_(std::move(services)), config_(config) {
+  assert(services_.plugins != nullptr && services_.factory != nullptr &&
+         services_.operations != nullptr && services_.audit != nullptr &&
+         services_.executor != nullptr && services_.async != nullptr &&
+         services_.sessions != nullptr && services_.publish_event != nullptr);
+}
 
 PluginLifecycleService::~PluginLifecycleService() = default;
 

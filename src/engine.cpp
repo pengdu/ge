@@ -293,18 +293,8 @@ Engine::Engine(EngineConfig config)
   ao.worker_thread = config_.async_worker_thread.value_or(config_.cpu_threads != 0);
   async_ = std::make_unique<AsyncRuntime>(ao);
 
-  PluginLifecycleServices ls;
-  ls.plugins = plugins_.get();
-  ls.factory = &factory_;
-  ls.operations = &operations_;
-  ls.audit = &audit_;
-  ls.executor = executor_.get();
-  ls.async = async_.get();
-  ls.publish_event = [this](SessionId session, std::string type, Severity severity, NodeId node,
-                            JsonValue detail) {
-    PublishSessionEvent(session, std::move(type), severity, node, std::move(detail));
-  };
-  lifecycle_ = std::make_unique<PluginLifecycleService>(std::move(ls), config_);
+  // SessionManager first: PluginLifecycleService requires it at construction
+  // (the upgrade sweep), while the manager only borrows engine-owned services.
   SessionManagerServices ss;
   ss.factory = &factory_;
   ss.executor = executor_.get();
@@ -315,7 +305,19 @@ Engine::Engine(EngineConfig config)
   sessions_ = std::make_unique<SessionManager>(
       std::move(ss), config_,
       [this](SessionId id, CallerContext caller) { return MakeSessionEvents(id, std::move(caller)); });
-  lifecycle_->set_sessions(sessions_.get());
+  PluginLifecycleServices ls;
+  ls.plugins = plugins_.get();
+  ls.factory = &factory_;
+  ls.operations = &operations_;
+  ls.audit = &audit_;
+  ls.executor = executor_.get();
+  ls.async = async_.get();
+  ls.sessions = sessions_.get();
+  ls.publish_event = [this](SessionId session, std::string type, Severity severity, NodeId node,
+                            JsonValue detail) {
+    PublishSessionEvent(session, std::move(type), severity, node, std::move(detail));
+  };
+  lifecycle_ = std::make_unique<PluginLifecycleService>(std::move(ls), config_);
 
   if (config_.watchdog_thread) watchdog_ = std::thread([this] { WatchdogLoop(); });
 }

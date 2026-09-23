@@ -16,6 +16,7 @@
 
 #include <ge/cpp/async_runtime.h>
 #include <ge/cpp/audit_log.h>
+#include <ge/cpp/engine_config.h>
 #include <ge/cpp/event_bus.h>
 #include <ge/cpp/graph_spec.h>
 #include <ge/cpp/graph_template.h>
@@ -26,63 +27,12 @@
 #include <ge/cpp/scheduler.h>
 #include <ge/cpp/session.h>
 #include <ge/cpp/types.h>
+#include <ge/cpp/upgrade_report.h>
 
 namespace ge {
 
 class SessionManager;
 class PluginLifecycleService;
-
-struct EngineConfig {
-  std::vector<std::filesystem::path> plugin_search_paths;
-  std::map<std::string, std::string> host_dependencies;
-  std::uint32_t cpu_threads = 4;  // 0 == inline executor (tests)
-  std::chrono::milliseconds watchdog_period{10};
-  bool watchdog_thread = true;
-  EventBus::Options events;
-  HostBufferPool::Options buffer_pool;
-  // AUD-1: audit ring capacity (observability_config_json `audit_capacity`).
-  std::size_t audit_capacity = 4096;
-  std::optional<std::string> engine_fingerprint;  // tests only; default GE_BUILD_FINGERPRINT
-  std::chrono::milliseconds default_drain_timeout{2000};
-  AsyncOptions async;
-  std::optional<bool> async_worker_thread;
-  // the PluginRegistry by CreateSession/GetCapability; UpgradeOperator stays
-  // plugin-only (builtins have no plugin lifecycle; use ReplaceNode).
-  std::shared_ptr<OperatorFactory> builtin_operators;
-  // ResourceLedger::DefaultCapacities(cpu_threads) at construction;
-  // resource_limits_json `resources` overrides per (kind[@device]).
-  // `admission: false` disables the ledger entirely (no session ever
-  // reserves; RES-1..4 off).
-  std::vector<ResourceCapacity> resource_capacities;
-  bool resource_admission = true;
-  bool reject_unbudgeted_edges = false;
-
-  [[nodiscard]] static Result<EngineConfig> FromJson(const char* plugin_search_paths_json,
-                                                     const char* resource_limits_json,
-                                                     const char* observability_config_json);
-};
-
-struct SessionUpgradeResult {
-  SessionId session = 0;
-  std::vector<std::string> nodes;  // replaced node ids
-  OperationId operation = 0;       // the ReplaceNode mutation
-  Status result;
-  [[nodiscard]] JsonValue ToJson() const;
-};
-
-struct UpgradeReport {
-  OperationId operation = 0;
-  PluginId old_plugin = 0;
-  PluginId new_plugin = 0;
-  std::vector<SessionUpgradeResult> sessions;
-  bool unloaded = false;  // old plugin logically unloaded (all succeeded, refs == 0)
-  [[nodiscard]] bool all_succeeded() const noexcept;
-  [[nodiscard]] JsonValue ToJson() const;
-};
-
-struct RetirePluginOptions {
-  bool request_physical_unload = false;
-};
 
 // Assembly root: owns the shared services (pool, ledger, events, plugin
 // registry, executor, async runtime) and the two lifecycle services, and
@@ -180,10 +130,15 @@ class Engine final {
   std::unique_ptr<AsyncRuntime> async_;
   OperationRegistry operations_;
   AuditLog audit_;
-  // Declared after the services they borrow: destroyed first, so their
-  // destructors see a live registry/executor.
-  std::unique_ptr<PluginLifecycleService> lifecycle_;
+  // Declared after the services they borrow, so they are destroyed first.
+  // Their destructors MUST NOT touch any borrowed service: ~Engine resets
+  // async_ (and stops the executor) in its body, *before* these members are
+  // destroyed, so by then services_.async is already dangling. SessionManager
+  // before PluginLifecycleService (construction order): the lifecycle service
+  // holds a SessionManager pointer from birth, and the reverse dependency
+  // does not exist -- so it is also destroyed first.
   std::unique_ptr<SessionManager> sessions_;
+  std::unique_ptr<PluginLifecycleService> lifecycle_;
   std::thread watchdog_;
   std::mutex watchdog_mutex_;
   std::condition_variable watchdog_cv_;

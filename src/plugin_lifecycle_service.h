@@ -1,8 +1,9 @@
 #ifndef GE_SRC_PLUGIN_LIFECYCLE_SERVICE_H_
 #define GE_SRC_PLUGIN_LIFECYCLE_SERVICE_H_
 
-#include <ge/cpp/engine.h>
+#include <ge/cpp/engine_config.h>
 #include <ge/cpp/plugin_registry.h>
+#include <ge/cpp/upgrade_report.h>
 
 #include <functional>
 #include <memory>
@@ -28,6 +29,9 @@ struct PluginLifecycleServices {
   AuditLog* audit = nullptr;
   ExecutorPool* executor = nullptr;
   AsyncRuntime* async = nullptr;
+  // Required: UpgradeOperator sweeps live sessions through it. The engine
+  // constructs SessionManager first (it does not depend on this service), so
+  // the pointer is valid for the whole service lifetime.
   SessionManager* sessions = nullptr;
   std::function<void(SessionId, std::string, Severity, NodeId, JsonValue)> publish_event;
 };
@@ -60,11 +64,6 @@ class PluginLifecycleService final {
 
   // Watchdog pass: finishes retires whose references have since dropped.
   void CompletePendingUnloads();
-
-  // The engine builds this service before SessionManager (the manager's event
-  // factory captures the engine); the upgrade sweep needs the manager, so it
-  // is plugged in right after construction.
-  void set_sessions(SessionManager* sessions) noexcept { services_.sessions = sessions; }
 
  private:
   struct PendingRetire {
