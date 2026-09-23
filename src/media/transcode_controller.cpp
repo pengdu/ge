@@ -49,7 +49,10 @@ Result<OperationId> TranscodeController::RemoveRendition(std::string_view id, bo
   const std::optional<RenditionSpec> spec = Lookup(id);
   if (!spec) return Status::NotFound("rendition '" + std::string(id) + "' not found");
   const RemovePolicy policy = drain ? RemovePolicy::kDrain : RemovePolicy::kFast;
-  Result<OperationId> op = session_.Apply(RenditionTemplate::RemoveRendition(id, policy, spec->audio, base_));
+  MutationPatch patch = RenditionTemplate::RemoveRendition(id, policy, spec->audio, base_);
+  auto& remove = std::get<RemoveBranchAction>(patch.actions.front());
+  for (const FilterSpec& filter : filters_[std::string(id)]) remove.nodes.push_back(RenditionTemplate::Ids(id).Filter(filter.id));
+  Result<OperationId> op = session_.Apply(std::move(patch));
   if (!op.ok()) return op;
   renditions_.erase(std::string(id));
   filters_.erase(std::string(id));
@@ -148,6 +151,8 @@ Result<OperationId> TranscodeController::SwitchCodec(std::string_view id, const 
   if (!old) return Status::NotFound("rendition '" + std::string(id) + "' not found");
   if (renditions_.contains(replacement.id)) return Status::AlreadyExists("rendition '" + replacement.id + "' exists");
   MutationPatch patch = RenditionTemplate::RemoveRendition(id, RemovePolicy::kDrain, old->audio, base_);
+  auto& remove = std::get<RemoveBranchAction>(patch.actions.front());
+  for (const FilterSpec& filter : filters_[std::string(id)]) remove.nodes.push_back(RenditionTemplate::Ids(id).Filter(filter.id));
   for (MutationAction& a : add->actions) patch.actions.push_back(std::move(a));
   Result<OperationId> op = session_.Apply(std::move(patch));
   if (!op.ok()) return op;

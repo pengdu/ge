@@ -561,6 +561,12 @@ TEST(MediaTranscodeTest, SwitchCodecReplacesBranchWithoutStoppingSharedDecoder) 
   ASSERT_TRUE(session->Start().ok());
   while (f.PacketsOut(session, "r.h264.venc") < 30) f.Turns(session, 1);
 
+  auto insert = ctl.InsertFilter("h264", FilterSpec{"box", "drawbox=x=0:y=0:w=80:h=40:color=white:t=fill"});
+  ASSERT_TRUE(insert.ok()) << insert.status().ToString();
+  auto insert_record = ctl.Wait(*insert, std::chrono::seconds(10));
+  ASSERT_TRUE(insert_record.ok()) << insert_record.status().ToString();
+  ASSERT_EQ(insert_record->state, ge::OperationState::kSucceeded) << insert_record->result.ToString();
+
   RenditionSpec r1 = f.Rendition("mpeg4", 320, 180, "mp4");
   r1.codec = "mpeg4";
   const auto t0 = std::chrono::steady_clock::now();
