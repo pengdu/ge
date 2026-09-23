@@ -37,7 +37,7 @@ Result<BatchReport> BatchRunner::Run(const std::vector<BatchItem>& items) {
       }
     }
   }
-  if (template_.validated() == nullptr) {
+  if (!template_.validated_for(engine_.operator_generation())) {
     if (Status s = engine_.PrevalidateTemplate(template_); !s.ok()) return s;
   }
 

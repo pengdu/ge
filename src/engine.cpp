@@ -643,7 +643,7 @@ Result<Session*> Engine::CreateSession(const GraphSpec& spec, CallerContext call
 }
 
 Status Engine::PrevalidateTemplate(GraphTemplate& tmpl) {
-  return tmpl.Prevalidate([this](const OperatorKey& k) { return factory_.Describe(k); });
+  return tmpl.Prevalidate([this](const OperatorKey& k) { return factory_.Describe(k); }, operator_generation());
 }
 
 Result<Session*> Engine::CreateSession(const GraphTemplate& tmpl, const JsonValue& arguments,
@@ -651,6 +651,17 @@ Result<Session*> Engine::CreateSession(const GraphTemplate& tmpl, const JsonValu
                                        OperationId* out_operation) {
   Result<GraphSpec> spec = tmpl.Instantiate(arguments, instance_name);
   if (!spec.ok()) return spec.status();
+  // The cached ValidatedGraph encodes the capabilities of the operator set
+  // that was loaded when Prevalidate() ran. A plugin loaded/retired since
+  // then invalidates it: revalidate here rather than negotiate against a
+  // stale descriptor set.
+  if (!tmpl.validated_for(operator_generation())) {
+    const auto resolver = [this](const OperatorKey& k) { return factory_.Describe(k); };
+    Result<ValidatedGraph> refreshed = GraphValidator(resolver).Validate(tmpl.skeleton());
+    if (!refreshed.ok()) return refreshed.status();
+    return CreateSession(*spec, std::move(caller), out_operation,
+                         std::make_shared<const ValidatedGraph>(std::move(*refreshed)));
+  }
   return CreateSession(*spec, std::move(caller), out_operation, tmpl.validated());
 }
 
@@ -658,6 +669,12 @@ Session* Engine::FindSession(SessionId id) const {
   std::lock_guard lock(sessions_mutex_);
   const auto it = sessions_.find(id);
   return it == sessions_.end() ? nullptr : it->second.get();
+}
+
+std::shared_ptr<Session> Engine::FindSessionShared(SessionId id) const {
+  std::lock_guard lock(sessions_mutex_);
+  const auto it = sessions_.find(id);
+  return it == sessions_.end() ? nullptr : it->second;
 }
 
 Status Engine::DestroySession(SessionId id) {

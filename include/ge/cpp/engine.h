@@ -105,12 +105,23 @@ class Engine final {
   // GM-3 batch reuse: validates |tmpl|'s skeleton against this engine's
   // operators once (idempotent; call again after LoadPlugin/UpgradeOperator
   // changed the operator set). Instances created through the overload below
-  // skip validation/negotiation and only run per-instance admission.
+  // skip validation/negotiation and only run per-instance admission -- unless
+  // the operator set moved since the last PrevalidateTemplate, in which case
+  // they fall back to full validation so a template can never be instantiated
+  // against stale capability negotiation.
   [[nodiscard]] Status PrevalidateTemplate(GraphTemplate& tmpl);
+  // Operator-set generation of this engine (PluginRegistry). Moves on every
+  // plugin load / logical unload.
+  [[nodiscard]] std::uint64_t operator_generation() const { return plugins_->operator_generation(); }
   [[nodiscard]] Result<Session*> CreateSession(const GraphTemplate& tmpl, const JsonValue& arguments,
                                                std::string_view instance_name = {}, CallerContext caller = {},
                                                OperationId* out_operation = nullptr);
   [[nodiscard]] Session* FindSession(SessionId id) const;
+  // Same lookup, but the returned reference keeps the Session alive: a
+  // concurrent DestroySession may remove it from the engine, yet the object
+  // survives until the caller drops the pointer (the C API resolves handles
+  // this way so a call in flight never races the destructor).
+  [[nodiscard]] std::shared_ptr<Session> FindSessionShared(SessionId id) const;
   // Stops (fast) if needed, waits for closure, then frees the session.
   [[nodiscard]] Status DestroySession(SessionId id);
   void StopAll(bool fast);

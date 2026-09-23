@@ -164,11 +164,12 @@ Result<GraphSpec> GraphTemplate::Instantiate(const JsonValue& arguments, std::st
   return spec;
 }
 
-Status GraphTemplate::Prevalidate(const CapabilityResolver& resolver) {
+Status GraphTemplate::Prevalidate(const CapabilityResolver& resolver, std::uint64_t operator_generation) {
   GraphValidator validator(resolver);
   Result<ValidatedGraph> validated = validator.Validate(skeleton_);
   if (!validated.ok()) return validated.status();
   validated_ = std::make_shared<const ValidatedGraph>(std::move(*validated));
+  validated_generation_ = operator_generation;
   return Status::Ok();
 }
 

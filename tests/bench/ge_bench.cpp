@@ -42,6 +42,17 @@
 #define GE_BENCH_SANITIZED 0
 #endif
 
+// The budgets below are wall-clock p50s on the reference machine and only mean
+// anything for an optimized build. An unoptimized (-O0, the default
+// CMAKE_BUILD_TYPE here) run is 2-5x off the numbers the budgets were set from,
+// so it reports the measurements and skips the verdict instead of failing on
+// the build's own overhead. Same rationale as the sanitizer gate above.
+#if defined(__OPTIMIZE__) || defined(_MSC_VER)
+#define GE_BENCH_OPTIMIZED 1
+#else
+#define GE_BENCH_OPTIMIZED 0
+#endif
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -371,7 +382,7 @@ int main(int argc, char** argv) {
   const double o_p50 = Percentile(overhead_us, 0.5);
 
   bool ok = true;
-  if (!GE_BENCH_SANITIZED) {
+  if (!GE_BENCH_SANITIZED && GE_BENCH_OPTIMIZED) {
     ok = v_p50 < 50.0 && l_p50 < 50.0 && o_p50 < 2.0;
   }
   if (json) {
@@ -379,15 +390,16 @@ int main(int argc, char** argv) {
         "{\"validate_100n_300e_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"budget\":50},"
         "\"pipeline_latency_us\":{\"p50\":%.3f,\"p99\":%.3f,\"budget_p50\":50,\"nodes\":%d,\"threads\":%u,\"packets\":%lld},"
         "\"schedule_overhead_us\":{\"p50\":%.4f,\"budget\":2},"
-        "\"sanitized\":%s,\"ok\":%s}\n",
+        "\"sanitized\":%s,\"optimized\":%s,\"ok\":%s}\n",
         v_p50, v_p90, l_p50, l_p99, kPipelineNodes, threads, static_cast<long long>(latency_packets), o_p50,
-        GE_BENCH_SANITIZED ? "true" : "false", ok ? "true" : "false");
+        GE_BENCH_SANITIZED ? "true" : "false", GE_BENCH_OPTIMIZED ? "true" : "false", ok ? "true" : "false");
   } else {
     std::printf("validate 100N/300E        p50 %.3f ms   p90 %.3f ms   (budget 50 ms)\n", v_p50, v_p90);
     std::printf("pipeline latency 10N/%uT   p50 %.3f us   p99 %.3f us   (budget p50 50 us, %lld packets)\n", threads,
                 l_p50, l_p99, static_cast<long long>(latency_packets));
     std::printf("schedule overhead/node    p50 %.4f us                (budget 2 us)\n", o_p50);
-    std::printf("%s\n", ok ? "OK" : "BUDGET EXCEEDED");
+    std::printf("%s\n", !GE_BENCH_OPTIMIZED ? "UNOPTIMIZED BUILD - budgets not applied"
+                                           : (ok ? "OK" : "BUDGET EXCEEDED"));
   }
   return ok ? 0 : 1;
 }

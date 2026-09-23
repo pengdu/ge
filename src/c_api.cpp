@@ -12,17 +12,28 @@
 // Opaque handles (13 §3.2)
 // ---------------------------------------------------------------------------
 
+// Every session/subscription handle points at one of these instead of at the
+// engine handle directly. |engine| is non-null exactly while the engine is
+// alive, so a derived handle that outlives ge_engine_destroy() resolves to
+// "destroyed" instead of dereferencing freed memory. The block is shared, not
+// owned by the handle struct, so clearing the engine in destroy() is enough to
+// invalidate every derived handle at once.
+struct ge_engine_token {
+  std::mutex mutex;
+  std::shared_ptr<ge::Engine> engine;
+};
+
 struct ge_engine_t {
-  std::unique_ptr<ge::Engine> engine;
+  std::shared_ptr<ge_engine_token> token;
 };
 
 struct ge_session_t {
-  ge_engine_t* owner = nullptr;
+  std::shared_ptr<ge_engine_token> owner;
   ge::SessionId id = 0;
 };
 
 struct ge_subscription_t {
-  ge_engine_t* owner = nullptr;
+  std::shared_ptr<ge_engine_token> owner;
   ge::SubscriptionId id = 0;
 };
 
@@ -56,9 +67,22 @@ ge::CallerContext ParseCaller(const char* json, ge::Status* error) {
   return c;
 }
 
-ge::Session* Resolve(ge_session_handle session) {
-  if (session == nullptr || session->owner == nullptr) return nullptr;
-  return session->owner->engine->FindSession(session->id);
+// Live Engine of |token|, or nullptr when ge_engine_destroy already ran. The
+// shared_ptr keeps the Engine alive for the duration of the call.
+std::shared_ptr<ge::Engine> LiveEngine(const std::shared_ptr<ge_engine_token>& token) {
+  if (token == nullptr) return nullptr;
+  std::lock_guard lock(token->mutex);
+  return token->engine;
+}
+
+// Live Session of |session|, or nullptr when the engine or the session is
+// gone. Shared ownership: a concurrent ge_session_destroy / watchdog-driven
+// DestroySession can remove the session from the engine, but the object stays
+// alive until this call returns.
+std::shared_ptr<ge::Session> Resolve(const ge_session_handle session) {
+  std::shared_ptr<ge::Engine> engine = LiveEngine(session != nullptr ? session->owner : nullptr);
+  if (engine == nullptr) return nullptr;
+  return engine->FindSessionShared(session->id);
 }
 
 template <typename F>
@@ -73,6 +97,15 @@ ge_status Guarded(F&& f) noexcept {
 }
 
 }  // namespace
+
+// Test-only window into the C++ engine behind an opaque handle. Not exported
+// and declared nowhere in include/; tests/unit/engine_test.cpp declares it
+// itself to drive the C++ side of a C-API-created session.
+ge::Engine* ge_engine_for_testing(ge_engine_handle engine) {
+  if (engine == nullptr) return nullptr;
+  std::lock_guard lock(engine->token->mutex);
+  return engine->token->engine.get();
+}
 
 extern "C" {
 
@@ -94,7 +127,8 @@ GE_EXPORT ge_status ge_engine_create(const ge_engine_config* config, ge_engine_h
     auto engine = ge::Engine::Create(std::move(*cfg));
     if (!engine.ok()) return ToC(engine.status());
     auto* h = new ge_engine_t;
-    h->engine = std::move(*engine);
+    h->token = std::make_shared<ge_engine_token>();
+    h->token->engine = std::move(*engine);
     *out_engine = h;
     return ge::OkStatus();
   });
@@ -102,6 +136,13 @@ GE_EXPORT ge_status ge_engine_create(const ge_engine_config* config, ge_engine_h
 
 GE_EXPORT void ge_engine_destroy(ge_engine_handle engine) {
   if (engine == nullptr) return;
+  {
+    // Under the token lock, so a concurrent session call either sees the
+    // engine (and holds a shared_ptr for its whole duration) or sees null. The
+    // token outlives the handle if a session/subscription still refers to it.
+    std::lock_guard lock(engine->token->mutex);
+    engine->token->engine.reset();
+  }
   delete engine;
 }
 
@@ -110,7 +151,9 @@ GE_EXPORT ge_status ge_engine_load_plugin(ge_engine_handle engine, const char* m
   return Guarded([&]() -> ge_status {
     if (engine == nullptr) return Invalid("engine is null");
     if (manifest_path == nullptr || out_plugin_id == nullptr) return Invalid("manifest_path/out_plugin_id is null");
-    auto info = engine->engine->LoadPlugin(manifest_path);
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
+    auto info = e->LoadPlugin(manifest_path);
     if (!info.ok()) return ToC(info.status());
     *out_plugin_id = info->id;
     return ge::OkStatus();
@@ -123,7 +166,9 @@ GE_EXPORT ge_status ge_engine_retire_plugin(ge_engine_handle engine, ge_plugin_i
   return Guarded([&]() -> ge_status {
     if (engine == nullptr) return Invalid("engine is null");
     if (out_operation_id == nullptr) return Invalid("out_operation_id is null");
-    auto op = engine->engine->RetirePlugin(plugin_id, {.request_physical_unload = request_physical_unload != 0});
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
+    auto op = e->RetirePlugin(plugin_id, {.request_physical_unload = request_physical_unload != 0});
     if (!op.ok()) return ToC(op.status());
     *out_operation_id = *op;
     return ge::OkStatus();
@@ -138,10 +183,12 @@ GE_EXPORT ge_status ge_engine_upgrade_operator(ge_engine_handle engine, const ch
     if (old_operator_key == nullptr || new_operator_key == nullptr || out_operation_id == nullptr) {
       return Invalid("operator keys/out_operation_id are null");
     }
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
     const auto old_key = ge::OperatorKey::Parse(old_operator_key);
     const auto new_key = ge::OperatorKey::Parse(new_operator_key);
     if (!old_key || !new_key) return Invalid("operator key must be type@version");
-    auto report = engine->engine->UpgradeOperator(*old_key, *new_key);
+    auto report = e->UpgradeOperator(*old_key, *new_key);
     if (!report.ok()) return ToC(report.status());
     *out_operation_id = report->operation;
     if (!report->all_succeeded()) {
@@ -163,17 +210,19 @@ GE_EXPORT ge_status ge_session_create(ge_engine_handle engine, const char* graph
     if (engine == nullptr) return Invalid("engine is null");
     if (graph_spec_json == nullptr || out_session == nullptr) return Invalid("graph_spec_json/out_session is null");
     *out_session = nullptr;
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
     auto spec = ge::GraphSpecParser::ParseGraph(graph_spec_json);
     if (!spec.ok()) return ToC(spec.status());
     ge::Status err;
     ge::CallerContext caller = ParseCaller(caller_context_json, &err);
     if (!err.ok()) return ToC(err);
     ge::OperationId op = 0;
-    auto s = engine->engine->CreateSession(*spec, std::move(caller), &op);
+    auto s = e->CreateSession(*spec, std::move(caller), &op);
     if (out_operation_id != nullptr) *out_operation_id = op;
     if (!s.ok()) return ToC(s.status());
     auto* h = new ge_session_t;
-    h->owner = engine;
+    h->owner = engine->token;
     h->id = (*s)->id();
     *out_session = h;
     return ge::OkStatus();
@@ -182,7 +231,7 @@ GE_EXPORT ge_status ge_session_create(ge_engine_handle engine, const char* graph
 
 GE_EXPORT ge_status ge_session_start(ge_session_handle session) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     return ToC(s->Start());
   });
@@ -190,7 +239,7 @@ GE_EXPORT ge_status ge_session_start(ge_session_handle session) {
 
 GE_EXPORT ge_status ge_session_pause(ge_session_handle session) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     return ToC(s->Pause());
   });
@@ -198,7 +247,7 @@ GE_EXPORT ge_status ge_session_pause(ge_session_handle session) {
 
 GE_EXPORT ge_status ge_session_resume(ge_session_handle session) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     return ToC(s->Resume());
   });
@@ -207,7 +256,7 @@ GE_EXPORT ge_status ge_session_resume(ge_session_handle session) {
 GE_EXPORT ge_status ge_session_stop(ge_session_handle session, uint8_t fast_shutdown,
                                     ge_operation_id* out_operation_id) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     if (out_operation_id == nullptr) return Invalid("out_operation_id is null");
     auto op = s->Stop(fast_shutdown != 0);
@@ -219,13 +268,15 @@ GE_EXPORT ge_status ge_session_stop(ge_session_handle session, uint8_t fast_shut
 
 GE_EXPORT void ge_session_destroy(ge_session_handle session) {
   if (session == nullptr) return;
-  if (session->owner != nullptr) (void)session->owner->engine->DestroySession(session->id);
+  if (std::shared_ptr<ge::Engine> e = LiveEngine(session->owner); e != nullptr) {
+    (void)e->DestroySession(session->id);
+  }
   delete session;
 }
 
 GE_EXPORT ge_status ge_session_get_snapshot_json(ge_session_handle session, char** out_json) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     if (out_json == nullptr) return Invalid("out_json is null");
     *out_json = Dup(s->Snapshot().Serialize());
@@ -245,7 +296,7 @@ GE_EXPORT void ge_string_free(ge_engine_handle, char* str) {
 GE_EXPORT ge_status ge_session_dry_run_patch(ge_session_handle session, const char* patch_json,
                                              char** out_result_json) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     if (patch_json == nullptr || out_result_json == nullptr) return Invalid("patch_json/out_result_json is null");
     auto patch = ge::GraphSpecParser::ParsePatch(patch_json);
@@ -261,7 +312,7 @@ GE_EXPORT ge_status ge_session_apply_patch(ge_session_handle session, const char
                                            const char* caller_context_json,
                                            ge_operation_id* out_operation_id) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     if (patch_json == nullptr || out_operation_id == nullptr) return Invalid("patch_json/out_operation_id is null");
     auto patch = ge::GraphSpecParser::ParsePatch(patch_json);
@@ -282,7 +333,7 @@ GE_EXPORT ge_status ge_session_set_node_parameters(ge_session_handle session, ge
                                                    ge_parameter_version* out_version,
                                                    ge_operation_id* out_operation_id) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     if (parameters_json == nullptr) return Invalid("parameters_json is null");
     ge::JsonParseResult parsed = ge::ParseJson(parameters_json);
@@ -308,7 +359,7 @@ GE_EXPORT ge_status ge_session_subscribe_events(ge_session_handle session, const
                                                 ge_event_callback callback, void* user_data,
                                                 ge_subscription_handle* out_subscription) {
   return Guarded([&]() -> ge_status {
-    ge::Session* s = Resolve(session);
+    const std::shared_ptr<ge::Session> s = Resolve(session);
     if (s == nullptr) return Invalid("session is null or destroyed");
     if (callback == nullptr || out_subscription == nullptr) return Invalid("callback/out_subscription is null");
     ge::EventFilter f;
@@ -321,7 +372,9 @@ GE_EXPORT ge_status ge_session_subscribe_events(ge_session_handle session, const
       f = std::move(*parsed);
     }
     f.session = s->id();  // a session subscription only sees its own events
-    const ge::SubscriptionId id = session->owner->engine->events().Subscribe(
+    std::shared_ptr<ge::Engine> e = LiveEngine(session->owner);
+    if (e == nullptr) return Invalid("engine is destroyed");
+    const ge::SubscriptionId id = e->events().Subscribe(
         std::move(f), [callback, user_data](const ge::Event& e) {
           const std::string detail = e.detail.Serialize();
           ge_event ev{};
@@ -351,7 +404,9 @@ GE_EXPORT ge_status ge_session_subscribe_events(ge_session_handle session, const
 
 GE_EXPORT void ge_subscription_cancel(ge_subscription_handle subscription) {
   if (subscription == nullptr) return;
-  if (subscription->owner != nullptr) subscription->owner->engine->events().Cancel(subscription->id);
+  if (std::shared_ptr<ge::Engine> e = LiveEngine(subscription->owner); e != nullptr) {
+    e->events().Cancel(subscription->id);
+  }
   delete subscription;
 }
 
@@ -360,7 +415,9 @@ GE_EXPORT ge_status ge_engine_get_operation_json(ge_engine_handle engine, ge_ope
   return Guarded([&]() -> ge_status {
     if (engine == nullptr) return Invalid("engine is null");
     if (out_json == nullptr) return Invalid("out_json is null");
-    const auto rec = engine->engine->operations().Get(operation);
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
+    const auto rec = e->operations().Get(operation);
     if (!rec) return ToC(ge::Status::NotFound("operation " + std::to_string(operation) + " not found"));
     *out_json = Dup(rec->ToJson().Serialize());
     return ge::OkStatus();
@@ -380,7 +437,9 @@ GE_EXPORT ge_status ge_engine_query_audit_json(ge_engine_handle engine, const ch
       if (!f.ok()) return ToC(f.status());
       filter = *f;
     }
-    *out_json = Dup(engine->engine->audit().QueryJson(filter).Serialize());
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
+    *out_json = Dup(e->audit().QueryJson(filter).Serialize());
     return ge::OkStatus();
   });
 }
@@ -389,7 +448,9 @@ GE_EXPORT ge_status ge_engine_render_prometheus(ge_engine_handle engine, char** 
   return Guarded([&]() -> ge_status {
     if (engine == nullptr) return Invalid("engine is null");
     if (out_text == nullptr) return Invalid("out_text is null");
-    *out_text = Dup(engine->engine->RenderPrometheus());
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
+    *out_text = Dup(e->RenderPrometheus());
     return ge::OkStatus();
   });
 }
@@ -401,7 +462,9 @@ GE_EXPORT ge_status ge_engine_get_capability_json(ge_engine_handle engine, const
     if (operator_key == nullptr || out_json == nullptr) return Invalid("operator_key/out_json is null");
     const auto key = ge::OperatorKey::Parse(operator_key);
     if (!key) return Invalid("operator key must be type@version");
-    auto cap = engine->engine->GetCapability(*key);
+    std::shared_ptr<ge::Engine> e = LiveEngine(engine->token);
+    if (e == nullptr) return Invalid("engine is destroyed");
+    auto cap = e->GetCapability(*key);
     if (!cap.ok()) return ToC(cap.status());
     *out_json = Dup(cap->Serialize());
     return ge::OkStatus();

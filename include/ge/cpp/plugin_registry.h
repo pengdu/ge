@@ -101,6 +101,12 @@ class PluginRegistry final : public OperatorFactory {
   [[nodiscard]] std::vector<PluginReference> SnapshotReferences(const OperatorKey& key) const;
   [[nodiscard]] std::vector<PluginAuditRecord> Audit() const;
 
+  // Monotonic counter of every change to the registered operator set (load
+  // registers keys, logical unload drops them). Callers that cache work
+  // derived from operator capabilities -- GraphTemplate::Prevalidate -- stamp
+  // it and re-derive when it moved. Cheap to read from any thread.
+  [[nodiscard]] std::uint64_t operator_generation() const noexcept;
+
   // OperatorFactory: Describe resolves every key whose plugin still has a
   // registry entry (retiring included, so running graphs validate); Create
   // is refused for retiring/unloaded plugins with PLUGIN_RETIRED.
@@ -137,6 +143,10 @@ class PluginRegistry final : public OperatorFactory {
                                   std::vector<OperatorEntry>* out) const;
   void Transition(Plugin& p, PluginState to);  // state_->mutex held
   [[nodiscard]] static PluginInfo InfoOf(const Plugin& p);  // state_->mutex held
+  // static: also called from the lease release lambda, which has no registry.
+  static void BumpOperatorGeneration(std::atomic<std::uint64_t>* counter) noexcept {
+    counter->fetch_add(1, std::memory_order_acq_rel);
+  }
 
   PluginRegistryOptions options_;
   // Shared with every lease so operators outliving the registry (never by

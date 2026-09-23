@@ -20,6 +20,7 @@
 //  * every placeholder must be declared, every declared parameter must be
 //    used, arguments must not name undeclared parameters, and required
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -57,8 +58,18 @@ class GraphTemplate final {
   // SessionOptions::prevalidated. Not thread safe against Instantiate --
   // call it before the batch starts (Engine::PrevalidateTemplate,
   // BatchRunner's constructor).
-  [[nodiscard]] Status Prevalidate(const CapabilityResolver& resolver);
+  //
+  // |operator_generation| is the caller's operator-set generation
+  // (PluginRegistry::operator_generation via Engine::operator_generation);
+  // the cache records it so a later instance can tell whether capability
+  // negotiation is still current. Engines pass 0 when they have no registry.
+  [[nodiscard]] Status Prevalidate(const CapabilityResolver& resolver, std::uint64_t operator_generation = 0);
   [[nodiscard]] std::shared_ptr<const ValidatedGraph> validated() const noexcept { return validated_; }
+  // False when never prevalidated, or when the operator set moved since.
+  [[nodiscard]] bool validated_for(std::uint64_t operator_generation) const noexcept {
+    return validated_ != nullptr && validated_generation_ == operator_generation;
+  }
+  [[nodiscard]] std::uint64_t validated_generation() const noexcept { return validated_generation_; }
 
  private:
   GraphTemplate(GraphSpec skeleton, std::vector<TemplateParameter> parameters)
@@ -67,6 +78,7 @@ class GraphTemplate final {
   GraphSpec skeleton_;
   std::vector<TemplateParameter> parameters_;
   std::shared_ptr<const ValidatedGraph> validated_;
+  std::uint64_t validated_generation_ = 0;
 };
 
 }  // namespace ge

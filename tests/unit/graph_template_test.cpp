@@ -131,9 +131,9 @@ struct BatchFixture {
 
   std::map<std::string, Collector*> collectors;
 
-  std::unique_ptr<Engine> MakeEngine() {
+  std::unique_ptr<Engine> MakeEngine(std::uint32_t cpu_threads = 0) {
     EngineConfig c;
-    c.cpu_threads = 0;
+    c.cpu_threads = cpu_threads;
     c.watchdog_thread = false;
     c.builtin_operators = factory;
     auto e = Engine::Create(std::move(c));
@@ -217,6 +217,50 @@ TEST(BatchRunnerTest, FailedItemIsRetriedAndOthersUnaffected) {
   EXPECT_EQ(report->items[0].attempts, 2);  // failed once, retried, succeeded
   EXPECT_EQ(report->items[1].attempts, 1);
   EXPECT_TRUE(engine->Sessions().empty());
+}
+
+// GM-3 / RES-1: an item that blows its time budget is fast-stopped, retried,
+// and every attempt returns its session and resource lease -- nothing may
+// accumulate across retries (the long-batch counterpart of the 24h "no leak"
+// acceptance in docs/09). Threaded engine: with an inline executor a
+// never-ending stream would spin RunPending() forever inside Pump(), so the
+// timeout could never interrupt it -- which is exactly why timeouts matter
+// on real deployments.
+TEST(BatchRunnerTest, ItemTimeoutRetriesAndReleasesEveryLease) {
+  BatchFixture f;
+  auto engine = f.MakeEngine(2);
+  ResourceLedger* ledger = engine->resource_ledger();
+  ASSERT_NE(ledger, nullptr);
+  auto t = GraphTemplate::Create(Skeleton(), Params());
+  ASSERT_TRUE(t.ok());
+
+  BatchOptions o;
+  o.concurrency = 2;
+  o.max_attempts = 2;
+  o.item_timeout = std::chrono::milliseconds(50);
+  BatchRunner runner(*engine, std::move(*t), o);
+  // "x" can never finish inside 50ms (2^40 packets); "y" is trivial and must
+  // be unaffected by its neighbour timing out (SC-7: no preemption of others).
+  auto report = runner.Run(
+      {BatchItem{"x", JsonValue(JsonObject{{"name", JsonValue("x")}, {"dir", JsonValue("/out")},
+                                           {"count", JsonValue(std::int64_t{1} << 40)}})},
+       BatchItem{"y", JsonValue(JsonObject{{"name", JsonValue("y")}, {"dir", JsonValue("/out")},
+                                           {"count", JsonValue(3)}})}});
+  ASSERT_TRUE(report.ok()) << report.status().ToString();
+  EXPECT_FALSE(report->ok());
+  EXPECT_EQ(report->failed, 1U);
+  EXPECT_EQ(report->succeeded, 1U);
+  const BatchItemResult& x = report->items[0];
+  EXPECT_EQ(x.attempts, 2);  // timed out, retried, timed out again
+  EXPECT_EQ(x.status.code(), GE_STATUS_CANCELLED) << x.status.ToString();
+  EXPECT_TRUE(report->items[1].status.ok()) << report->items[1].status.ToString();
+  ASSERT_NE(f.collectors["/out/y.bin"], nullptr);
+  EXPECT_EQ(f.collectors["/out/y.bin"]->Seqs().size(), 3U);
+  // Every attempt's session is gone and returned its lease (RES-1); no
+  // buffers left in flight either.
+  EXPECT_TRUE(engine->Sessions().empty());
+  EXPECT_EQ(ledger->live_leases(), 0U);
+  EXPECT_EQ(f.pool->stats().live_buffers, 0U);
 }
 
 TEST(BatchRunnerTest, ExhaustedAttemptsReportFailure) {

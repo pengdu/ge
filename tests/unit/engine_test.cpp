@@ -12,6 +12,10 @@
 #include <ge/c/ge_engine.h>
 #include <ge/cpp/graph_spec_json.h>
 
+// Defined in src/c_api.cpp; not exported, not in the public headers. Lets the
+// C API tests drive the C++ side of a session the C API created.
+ge::Engine* ge_engine_for_testing(ge_engine_handle engine);
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -511,6 +515,126 @@ TEST(EngineTest, ThreadedEngineRunsPluginAsyncOperator) {
   EXPECT_EQ(e.async_runtime().timeout_gap_total(), 0U);
 }
 
+// docs/09 "so 升级后 24h 无延迟崩溃", compressed: upgrade the operator,
+// physically unload (dlclose) the old plugin once its references drop, then
+// keep running sessions, mutations and snapshots on the survivor. A dangling
+// reference into the unloaded so (descriptor, vtable, string) crashes here,
+// not 24h later. Also covers "加载卸载零数据面影响": the running stream's
+// packet count is exact throughout.
+TEST(EngineTest, PhysicalUnloadAfterUpgradeLeavesNoDanglingReferences) {
+  auto engine = ge::Engine::Create(InlineConfig());
+  ASSERT_TRUE(engine.ok());
+  ge::Engine& e = **engine;
+  auto v1 = e.LoadPlugin(PluginDir() / "sample_plugin.json");
+  auto v2 = e.LoadPlugin(PluginDir() / "sample_plugin_v2.json");
+  ASSERT_TRUE(v1.ok() && v2.ok());
+  auto s = e.CreateSession(Linear("live", 500));
+  ASSERT_TRUE(s.ok());
+  ASSERT_TRUE((*s)->Start().ok());
+  RunSome(e, *s, 10);
+
+  auto rep = e.UpgradeOperator(Op("Pass@1.0.0"), Op("Pass@2.0.0"));
+  ASSERT_TRUE(rep.ok()) << rep.status().ToString();
+  EXPECT_TRUE(rep->all_succeeded());
+  // v1 is retiring but still referenced (src/sink); ask for a physical
+  // unload, which must wait for those references instead of dlclosing a
+  // library the running graph still executes.
+  auto retire = e.RetirePlugin(v1->id, {.request_physical_unload = true});
+  ASSERT_TRUE(retire.ok());
+  EXPECT_EQ(e.plugins().Get(v1->id)->state, ge::PluginState::kRetiring);
+  ASSERT_TRUE(RunToStop(e, *s));
+  EXPECT_EQ(Metric((*s)->Snapshot(), "sink", "packets_in"), 500);  // zero data-plane impact
+  ASSERT_TRUE(e.DestroySession((*s)->id()).ok());
+  e.Tick();  // references dropped -> pending physical unload completes
+  EXPECT_EQ(e.plugins().Get(v1->id)->state, ge::PluginState::kPhysicallyUnloaded);
+  EXPECT_EQ(e.operations().Get(*retire)->detail.GetBool("physically_unloaded").value_or(false), true);
+
+  // Life after dlclose: everything that could hold a pointer into the old
+  // so still works -- new sessions on v2 operators only, hot updates,
+  // snapshots, capability queries, audit, and repeated full streams.
+  EXPECT_EQ(e.GetCapability(Op("Pass@1.0.0")).status().code(), GE_STATUS_NOT_FOUND);
+  auto cap = e.GetCapability(Op("Pass@2.0.0"));
+  ASSERT_TRUE(cap.ok());
+  const auto v2_linear = [](const char* name, int count) {
+    ge::GraphBuilder g(name);
+    auto src = g.AddNode(Op("Src@2.0.0"), "src", ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(count)}}));
+    auto pass = g.AddNode(Op("Pass@2.0.0"), "pass");
+    auto sink = g.AddNode(Op("Sink@2.0.0"), "sink");
+    g.Connect(src.port("out"), pass.port("in"), {.id = "e0"});
+    g.Connect(pass.port("out"), sink.port("in"), {.id = "e1"});
+    return *g.Build();
+  };
+  for (int round = 0; round < 3; ++round) {
+    auto s2 = e.CreateSession(v2_linear(("after" + std::to_string(round)).c_str(), 200));
+    ASSERT_TRUE(s2.ok()) << s2.status().ToString();
+    ASSERT_TRUE((*s2)->Start().ok());
+    RunSome(e, *s2, 5);
+    ASSERT_TRUE((*s2)->SetParameters("pass", ge::JsonValue(ge::JsonObject{{"gain", ge::JsonValue(round)}})).ok());
+    ASSERT_TRUE(RunToStop(e, *s2));
+    EXPECT_EQ(Metric((*s2)->Snapshot(), "sink", "packets_in"), 200);
+    EXPECT_EQ(NodeOp((*s2)->Snapshot(), "pass"), "Pass@2.0.0");
+    ASSERT_TRUE(e.DestroySession((*s2)->id()).ok());
+  }
+  // The audit trail of the unloaded plugin survives the dlclose (PLG-8).
+  bool unload_audited = false;
+  for (const ge::PluginAuditRecord& r : e.plugins().Audit()) {
+    unload_audited = unload_audited || (r.plugin_id == v1->id && r.action == "physical_unload");
+  }
+  EXPECT_TRUE(unload_audited);
+}
+
+// ---------------------------------------------------------------------------
+// GM-3 / TD-01: template reuse (A4/A5 once per template) vs. operator set
+// changes.
+// ---------------------------------------------------------------------------
+
+// The prevalidated cache must not outlive the operator set it was computed
+// against: after a plugin load the instance is revalidated instead of being
+// negotiated against capabilities that no longer describe the registry.
+TEST(EngineTest, PrevalidatedTemplateIsRevalidatedAfterOperatorSetChange) {
+  auto engine = ge::Engine::Create(InlineConfig());
+  ASSERT_TRUE(engine.ok());
+  ge::Engine& e = **engine;
+  ASSERT_TRUE(e.LoadPlugin(PluginDir() / "sample_plugin.json").ok());
+
+  auto created = ge::GraphTemplate::Create(Linear("t", 5), {});
+  ASSERT_TRUE(created.ok()) << created.status().ToString();
+  ge::GraphTemplate tmpl = std::move(*created);
+  ASSERT_TRUE(e.PrevalidateTemplate(tmpl).ok());
+  const std::uint64_t stamp = tmpl.validated_generation();
+  EXPECT_EQ(stamp, e.operator_generation());
+  EXPECT_TRUE(tmpl.validated_for(e.operator_generation()));
+
+  // A second plugin moves the operator generation, so the stamp is stale...
+  ASSERT_TRUE(e.LoadPlugin(PluginDir() / "sample_plugin_v2.json").ok());
+  EXPECT_GT(e.operator_generation(), stamp);
+  EXPECT_FALSE(tmpl.validated_for(e.operator_generation()));
+  // ...but creating an instance still works: it revalidates internally
+  // instead of using the cache.
+  auto s = e.CreateSession(tmpl, ge::JsonValue(ge::JsonObject{}));
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ASSERT_TRUE((*s)->Start().ok());
+  ASSERT_TRUE(RunToStop(e, *s));
+  EXPECT_EQ(Metric((*s)->Snapshot(), "sink", "packets_in"), 5);
+}
+
+TEST(EngineTest, PrevalidateTemplateRevalidatesOnSecondCall) {
+  auto engine = ge::Engine::Create(InlineConfig());
+  ASSERT_TRUE(engine.ok());
+  ge::Engine& e = **engine;
+  auto created = ge::GraphTemplate::Create(Linear("t", 5), {});
+  ASSERT_TRUE(created.ok());
+  ge::GraphTemplate tmpl = std::move(*created);
+  // Unknown operators: prevalidation fails and caches nothing.
+  EXPECT_FALSE(e.PrevalidateTemplate(tmpl).ok());
+  EXPECT_EQ(tmpl.validated(), nullptr);
+  EXPECT_FALSE(tmpl.validated_for(e.operator_generation()));
+
+  ASSERT_TRUE(e.LoadPlugin(PluginDir() / "sample_plugin.json").ok());
+  ASSERT_TRUE(e.PrevalidateTemplate(tmpl).ok());
+  EXPECT_TRUE(tmpl.validated_for(e.operator_generation()));
+}
+
 // ---------------------------------------------------------------------------
 // C API (13 §5): the same scenarios through ge_engine_* / ge_session_*.
 // ---------------------------------------------------------------------------
@@ -529,7 +653,7 @@ struct CEngine {
     EXPECT_EQ(st.code, GE_STATUS_OK) << (st.message ? st.message : "");
   }
   ~CEngine() { ge_engine_destroy(h); }
-  ge::Engine& cpp() { return *reinterpret_cast<std::unique_ptr<ge::Engine>*>(h)->get(); }
+  ge::Engine& cpp() { return *ge_engine_for_testing(h); }
 };
 
 std::string GraphJson(const char* name, int count, const char* pass = "Pass@1.0.0") {
@@ -571,6 +695,112 @@ TEST(CApiTest, EngineCreateRejectsBadHeaderAndConfig) {
   ge_session_destroy(nullptr);
   ge_subscription_cancel(nullptr);
   ge_string_free(nullptr, nullptr);
+}
+
+// Lifecycle (Code Complete -- Defensive Programming): a session/subscription
+// handle whose engine is gone must resolve to a status, never dereference
+// freed memory. Regression test for the dangling ge_engine_t* owner. Destroying
+// the engine handle itself is not exercised here: the handle address is the
+// host's to keep alive, so using it afterwards is out of contract (13 §3.2).
+TEST(CApiTest, HandlesSurviveEngineDestroyWithoutDereferencingFreedMemory) {
+  std::string paths = std::string("[\"") + PluginDir().string() + "\"]";
+  ge_engine_config cfg;
+  cfg.header = GE_STRUCT_HEADER_INIT(ge_engine_config);
+  cfg.plugin_search_paths_json = paths.c_str();
+  cfg.resource_limits_json = nullptr;
+  cfg.observability_config_json = nullptr;
+  ge_engine_handle h = nullptr;
+  ASSERT_EQ(ge_engine_create(&cfg, &h).code, GE_STATUS_OK);
+  ge_plugin_id pid = 0;
+  const std::string manifest = (PluginDir() / "sample_plugin.json").string();
+  ASSERT_EQ(ge_engine_load_plugin(h, manifest.c_str(), &pid).code, GE_STATUS_OK);
+
+  ge_session_handle s = nullptr;
+  ge_status cs = ge_session_create(h, GraphJson("h", 5).c_str(), nullptr, &s, nullptr);
+  ASSERT_EQ(cs.code, GE_STATUS_OK) << (cs.message ? cs.message : "");
+  ASSERT_EQ(ge_session_start(s).code, GE_STATUS_OK);
+  ge_subscription_handle sub = nullptr;
+  ASSERT_EQ(ge_session_subscribe_events(s, nullptr, [](const ge_event*, void*) {}, nullptr, &sub).code,
+            GE_STATUS_OK);
+
+  ge_engine_destroy(h);  // the host destroys the engine before its handles
+
+  EXPECT_EQ(ge_session_start(s).code, GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ge_session_pause(s).code, GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ge_session_resume(s).code, GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ge_session_stop(s, 1, nullptr).code, GE_STATUS_INVALID_ARGUMENT);
+  char* json = nullptr;
+  EXPECT_EQ(ge_session_get_snapshot_json(s, &json).code, GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(json, nullptr);
+  EXPECT_EQ(ge_session_apply_patch(s, "{}", nullptr, nullptr).code, GE_STATUS_INVALID_ARGUMENT);
+  EXPECT_EQ(ge_session_set_node_parameters(s, 1, "{}", nullptr, nullptr, nullptr).code,
+            GE_STATUS_INVALID_ARGUMENT);
+
+  // Destroying them afterwards is a no-op, not a second dereference.
+  ge_session_destroy(s);
+  ge_subscription_cancel(sub);
+}
+
+// Concurrency (00 REL: no delayed crash after teardown): C API calls racing
+// a DestroySession on another thread must never dereference a freed Session.
+// Resolve() hands out shared ownership, so a call that started before the
+// destroy finishes on a live object and later calls see INVALID_ARGUMENT.
+// The destroy runs through the C++ engine (as the watchdog or another host
+// thread would); the C handle itself stays alive for the whole race, since
+// its own destroy is the host's serialisation point (13 §3.2). Threaded
+// engine + 1ms watchdog keeps watchdog Tick() snapshots in the race too.
+TEST(CApiTest, SessionCallsRacingDestroyResolveOrFailCleanly) {
+  std::string paths = std::string("[\"") + PluginDir().string() + "\"]";
+  ge_engine_config cfg;
+  cfg.header = GE_STRUCT_HEADER_INIT(ge_engine_config);
+  cfg.plugin_search_paths_json = paths.c_str();
+  cfg.resource_limits_json = R"({"cpu_threads":2})";
+  cfg.observability_config_json = R"({"watchdog_period_ms":1})";
+  ge_engine_handle h = nullptr;
+  ASSERT_EQ(ge_engine_create(&cfg, &h).code, GE_STATUS_OK);
+  ge_plugin_id pid = 0;
+  const std::string manifest = (PluginDir() / "sample_plugin.json").string();
+  ASSERT_EQ(ge_engine_load_plugin(h, manifest.c_str(), &pid).code, GE_STATUS_OK);
+  ge::Engine& e = *ge_engine_for_testing(h);
+
+  for (int round = 0; round < 5; ++round) {
+    ge_session_handle s = nullptr;
+    const std::string graph = GraphJson(("race" + std::to_string(round)).c_str(), 100000);
+    ASSERT_EQ(ge_session_create(h, graph.c_str(), nullptr, &s, nullptr).code, GE_STATUS_OK);
+    ASSERT_EQ(ge_session_start(s).code, GE_STATUS_OK);
+    const std::vector<ge::SessionId> ids = e.Sessions();
+    ASSERT_EQ(ids.size(), 1U);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> ok_calls{0}, gone_calls{0};
+    std::thread caller([&] {
+      while (!stop.load(std::memory_order_acquire)) {
+        char* json = nullptr;
+        const ge_status st = ge_session_get_snapshot_json(s, &json);
+        // Either a live snapshot or "destroyed"; never a crash.
+        if (st.code == GE_STATUS_OK) {
+          EXPECT_NE(json, nullptr);
+          ge_string_free(h, json);
+          ++ok_calls;
+        } else {
+          EXPECT_EQ(st.code, GE_STATUS_INVALID_ARGUMENT) << (st.message ? st.message : "");
+          ++gone_calls;
+        }
+        (void)ge_session_pause(s);
+        (void)ge_session_resume(s);
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    ASSERT_TRUE(e.DestroySession(ids[0]).ok());  // concurrent with the caller thread
+    // After the destroy returned, every further call resolves to "destroyed".
+    char* json = nullptr;
+    EXPECT_EQ(ge_session_get_snapshot_json(s, &json).code, GE_STATUS_INVALID_ARGUMENT);
+    stop.store(true, std::memory_order_release);
+    caller.join();
+    EXPECT_GT(ok_calls.load() + gone_calls.load(), 0);
+    ge_session_destroy(s);  // no-op destroy of an already-destroyed session
+  }
+  ge_engine_destroy(h);
 }
 
 TEST(CApiTest, PluginLoadRejectionsAndCapability) {

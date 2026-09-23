@@ -630,6 +630,91 @@ TEST(AsyncRuntimeTest, ReplaceNodeDeliversOldResultsOnOldPathThenRetires) {
   EXPECT_TRUE(s->WaitStopped(std::chrono::milliseconds(0)));
 }
 
+// ASY-10 (00 §3.9): after a graph change, late results that belong to the
+// old topology must never be injected into the new one. The old node's drain
+// times out (upgrading the retire to fast, 12 §7.6) and its in-flight
+// requests expire (ASY-9 bound: max_inference_ms); the new topology finishes
+// the stream on its own, and when the stale old-topology results finally
+// arrive they change nothing -- no seq is delivered twice and none of the
+// old node's in-flight seqs reach the sink.
+TEST(AsyncRuntimeTest, LateOldTopologyResultsAfterDrainTimeoutAreOrphanedNotInjected) {
+  Fixture f;
+  ge::ExecutorPool exec(0);
+  const ge::JsonValue infer_options(ge::JsonObject{{"batch", ge::JsonValue(false)},
+                                                   {"async_max_in_flight", ge::JsonValue(3)}});
+  ge::SessionOptions so;
+  so.drain_timeout = std::chrono::milliseconds(20);
+  auto s = f.Create(Linear(10, infer_options, "Infer@1.0.0", 4), exec, so);
+  ASSERT_TRUE(s->Start().ok());
+  Drain(f, exec, *s);
+  ASSERT_EQ(f.backend.pending(), 3U);  // seqs 1..3 in flight on the old node
+  ge::NodeRuntime* old_node = s->current_topology()->FindNode("infer");
+
+  auto op = s->Apply(ge::Mutation().ReplaceNode("infer", Op("Infer@2.0.0"), infer_options).Build());
+  ASSERT_TRUE(op.ok());
+  Drain(f, exec, *s);
+  EXPECT_EQ(s->topology_version(), 2U);
+  EXPECT_TRUE(old_node->retiring());
+
+  // Completes (in submission order) only the jobs a given node submitted,
+  // leaving the other node's requests pending.
+  const auto complete_node = [&](const std::string& node) {
+    for (;;) {
+      std::size_t idx = static_cast<std::size_t>(-1);
+      {
+        std::lock_guard lock(f.backend.mutex);
+        for (std::size_t i = 0; i < f.backend.jobs.size(); ++i) {
+          if (f.backend.jobs[i].node == node) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      if (idx == static_cast<std::size_t>(-1)) break;
+      (void)f.backend.Complete(idx);
+    }
+  };
+
+  // The old results never arrive in time: the 20ms drain deadline upgrades
+  // the retire to fast (cancelling the old node) and the 50ms inference
+  // deadline (ASY-9 bound) expires its three in-flight requests, closing it.
+  // The old backend jobs stay pending (never completed) throughout.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  // Drive the new topology to completion, completing only its jobs.
+  for (int round = 0; round < 40 && !s->WaitStopped(std::chrono::milliseconds(0)); ++round) {
+    complete_node("infer@2");
+    Drain(f, exec, *s);
+  }
+  ASSERT_TRUE(s->WaitStopped(std::chrono::milliseconds(0)));
+  EXPECT_TRUE(old_node->cancelled());
+  EXPECT_EQ(old_node->state(), ge::NodeState::kClosed);
+  const ge::OperationRecord rec = WaitOp(f.ops, *op, 100);  // already finished
+  EXPECT_EQ(rec.state, ge::OperationState::kSucceeded);
+  EXPECT_EQ(rec.detail.GetBool("drain_timeout_upgraded_to_fast").value_or(false), true);
+
+  const auto delivered = f.sinks["sink"]->Seqs();
+  // The three seqs the old node held in flight never reached the sink.
+  for (ge::PacketSeq lost : {1U, 2U, 3U}) {
+    EXPECT_EQ(std::count(delivered.begin(), delivered.end(), lost), 0) << "seq " << lost;
+  }
+  std::set<ge::PacketSeq> unique(delivered.begin(), delivered.end());
+  EXPECT_EQ(unique.size(), delivered.size()) << "duplicate seq delivered";
+
+  // The stale old-topology results arrive now, after the switch and the
+  // session stop. They belong to a retired topology and a detached sink:
+  // injecting them would change the sink -- it must not.
+  std::size_t stale_pending = 0;
+  {
+    std::lock_guard lock(f.backend.mutex);
+    for (const FakeBackend::Job& j : f.backend.jobs) stale_pending += j.node == "infer" ? 1 : 0;
+  }
+  EXPECT_EQ(stale_pending, 3U);
+  complete_node("infer");
+  Drain(f, exec, *s);
+  EXPECT_EQ(f.sinks["sink"]->Seqs(), delivered) << "late old-topology result was injected";
+  EXPECT_EQ(f.runtime->in_flight(), 0U);
+}
+
 TEST(AsyncRuntimeTest, FastStopWaitsForInFlightThenDropsResultsAsOrphans) {
   Fixture f;
   ge::ExecutorPool exec(0);

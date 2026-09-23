@@ -138,6 +138,10 @@ struct PluginRegistry::State {
   std::vector<PluginAuditRecord> audit;
   std::size_t audit_capacity = 4096;
   PluginId next_id = 1;
+  // Bumped on every change to |keys|. Lives here (not on PluginRegistry) so
+  // the lease release lambda -- which only holds this State -- can bump it
+  // when the last reference to a retiring plugin drops its keys.
+  std::atomic<std::uint64_t> operator_generation{0};
   std::function<void(const PluginInfo&, PluginState, PluginState)>* on_state_changed = nullptr;
 
   void Append(PluginId id, std::string action, JsonValue detail) {  // mutex held
@@ -462,6 +466,7 @@ Result<PluginInfo> PluginRegistry::Load(const std::filesystem::path& manifest_pa
   p->state = PluginState::kRegistered;
   for (const OperatorEntry& e : p->loaded.operators) state_->keys[e.key] = p->id;
   state_->plugins[p->id] = p;
+  BumpOperatorGeneration(&state_->operator_generation);
   JsonArray ops;
   for (const OperatorEntry& e : p->loaded.operators) ops.emplace_back(e.key.ToString());
   state_->Append(p->id, "load",
@@ -494,6 +499,7 @@ Status PluginRegistry::Retire(PluginId id) {
     notify.emplace_back(InfoOf(p), std::make_pair(from, PluginState::kRetiring));
     if (p.reference_count == 0) {
       for (const OperatorEntry& e : p.loaded.operators) state_->keys.erase(e.key);
+      BumpOperatorGeneration(&state_->operator_generation);
       Transition(p, PluginState::kLogicallyUnloaded);
       state_->Append(id, "logical_unload", JsonValue(JsonObject{}));
       notify.emplace_back(InfoOf(p), std::make_pair(PluginState::kRetiring, PluginState::kLogicallyUnloaded));
@@ -528,6 +534,7 @@ Status PluginRegistry::LogicalUnload(PluginId id) {
     }
     from = p.state;
     for (const OperatorEntry& e : p.loaded.operators) state_->keys.erase(e.key);
+    BumpOperatorGeneration(&state_->operator_generation);
     Transition(p, PluginState::kLogicallyUnloaded);
     state_->Append(id, "logical_unload", JsonValue(JsonObject{}));
     notify = InfoOf(p);
@@ -582,6 +589,10 @@ std::vector<PluginInfo> PluginRegistry::List() const {
   std::vector<PluginInfo> out;
   for (const auto& [id, p] : state_->plugins) out.push_back(InfoOf(*p));
   return out;
+}
+
+std::uint64_t PluginRegistry::operator_generation() const noexcept {
+  return state_->operator_generation.load(std::memory_order_acquire);
 }
 
 std::optional<PluginId> PluginRegistry::Resolve(const OperatorKey& key) const {
@@ -686,6 +697,7 @@ Result<std::unique_ptr<Operator>> PluginRegistry::Create(const OperatorCreateArg
         st->Append(pid, "release", ref.ToJson());
         if (pl.state == PluginState::kRetiring && pl.reference_count == 0) {
           for (const OperatorEntry& e : pl.loaded.operators) st->keys.erase(e.key);
+          BumpOperatorGeneration(&st->operator_generation);
           pl.state = PluginState::kLogicallyUnloaded;
           st->Append(pid, "state", JsonValue(JsonObject{{"from", JsonValue("retiring")},
                                                         {"to", JsonValue("logically_unloaded")}}));
