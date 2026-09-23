@@ -1,6 +1,12 @@
 set (install_prefix "@CMAKE_CURRENT_BINARY_DIR@/install-consumer-prefix")
 set (consumer_build "@CMAKE_CURRENT_BINARY_DIR@/install-consumer-build")
 set (fixture "@CMAKE_CURRENT_SOURCE_DIR@/tests/install_consumer")
+set (consumer_sanitizer_flag "")
+if (@GE_ENABLE_SANITIZERS@)
+  set (consumer_sanitizer_flag "address,undefined")
+elseif (@GE_ENABLE_TSAN@)
+  set (consumer_sanitizer_flag "thread")
+endif ()
 
 file (REMOVE_RECURSE "${install_prefix}" "${consumer_build}")
 
@@ -13,6 +19,7 @@ endif ()
 
 execute_process (
   COMMAND "@CMAKE_COMMAND@" -S "${fixture}" -B "${consumer_build}" -DCMAKE_PREFIX_PATH=${install_prefix}
+          -DGE_CONSUMER_SANITIZER=${consumer_sanitizer_flag}
   RESULT_VARIABLE configure_rc)
 if (NOT configure_rc EQUAL 0)
   message (FATAL_ERROR "install consumer fixture: find_package configuration failed (${configure_rc})")
