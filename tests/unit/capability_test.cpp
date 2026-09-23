@@ -154,6 +154,20 @@ TEST(NegotiatorTest, CallerPreferenceOverridesPortPriority) {
   EXPECT_EQ(r->video->pixel_format, "P010");
 }
 
+TEST(NegotiatorTest, P010SourceIntoNv12SinkIsRefusedWithConvertSuggestion) {
+  ge::CapabilityNegotiator n;
+  const auto r = n.NegotiateEdge(Op("A@1.0.0"), 1, VideoOut({"P010"}), Op("B@1.0.0"), 1,
+                                 VideoIn({"NV12"}), std::nullopt, {});
+  ASSERT_FALSE(r.ok());
+  EXPECT_EQ(r.status().code(), GE_STATUS_CAPABILITY_CONFLICT);
+  ASSERT_TRUE(n.last_conflict().has_value());
+  EXPECT_EQ(n.last_conflict()->dimension, "pixel_format");
+  EXPECT_EQ(n.last_conflict()->suggested_converter, "VideoConvert");
+  const std::string context = r.status().context_json();
+  EXPECT_NE(context.find("P010"), std::string::npos);
+  EXPECT_NE(context.find("NV12"), std::string::npos);
+}
+
 TEST(NegotiatorTest, ConflictReportsDimensionAndConverter) {
   ge::CapabilityNegotiator n;
   const auto r = n.NegotiateEdge(Op("A@1.0.0"), 1, VideoOut({"NV12"}), Op("B@1.0.0"), 1,

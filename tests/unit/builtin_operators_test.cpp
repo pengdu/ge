@@ -187,6 +187,47 @@ TEST(BuiltinOperatorsTest, EngineResolvesBuiltinsBeforePluginsAndPassesContracts
   ASSERT_TRUE(e.DestroySession((*s)->id()).ok());
 }
 
+TEST(BuiltinOperatorsTest, TeeThenConvertRepairsIncompatibleFanoutConsumer) {
+  Builtins b;
+  auto p010_sink = std::make_shared<Collector>();
+  auto converter = std::make_shared<Probe>();
+  b.factory->Register(Desc("P010Sink@1.0.0", {VideoPort("in", ge::PortDirection::kInput, {"P010"})}, {}),
+                      [&b, p010_sink](const ge::OperatorCreateArgs&) { return Keep(b.keep, p010_sink); });
+  b.factory->Register(
+      Desc("Convert@1.0.0", {VideoPort("in", ge::PortDirection::kInput, {"NV12"})},
+           {VideoPort("out", ge::PortDirection::kOutput, {"P010"}, ge::PortCardinality::kMulti)}, false, 1),
+      [&b, converter](const ge::OperatorCreateArgs&) { return Keep(b.keep, converter); });
+
+  auto engine = ge::Engine::Create(InlineConfig(b));
+  ASSERT_TRUE(engine.ok());
+  ge::Engine& e = **engine;
+
+  ge::GraphBuilder bad("bad_fanout");
+  auto bad_src = bad.AddNode(Op("VSrc@1.0.0"), "src");
+  auto bad_nv12 = bad.AddNode(Op("VSink@1.0.0"), "nv12");
+  auto bad_p010 = bad.AddNode(Op("P010Sink@1.0.0"), "p010");
+  bad.Connect(bad_src.port("out"), bad_nv12.port("in"), {.id = "nv12"});
+  bad.Connect(bad_src.port("out"), bad_p010.port("in"), {.id = "p010"});
+  EXPECT_EQ(e.CreateSession(*bad.Build()).status().code(), GE_STATUS_CAPABILITY_CONFLICT);
+
+  ge::GraphBuilder repaired("tee_convert");
+  auto src = repaired.AddNode(Op("VSrc@1.0.0"), "src", ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(37)}}));
+  auto nv12 = repaired.AddNode(Op("VSink@1.0.0"), "nv12");
+  auto convert = repaired.AddNode(Op("Convert@1.0.0"), "convert");
+  auto p010 = repaired.AddNode(Op("P010Sink@1.0.0"), "p010");
+  repaired.Connect(src.port("out"), nv12.port("in"), {.id = "tee_nv12"});
+  repaired.Connect(src.port("out"), convert.port("in"), {.id = "tee_convert"});
+  repaired.Connect(convert.port("out"), p010.port("in"), {.id = "convert_p010"});
+  auto session = e.CreateSession(*repaired.Build());
+  ASSERT_TRUE(session.ok()) << session.status().ToString();
+  ASSERT_TRUE((*session)->Start().ok());
+  ASSERT_TRUE(RunToStop(e, *session));
+  EXPECT_EQ(b.sink->Seqs().size(), 37U);
+  EXPECT_EQ(p010_sink->Seqs().size(), 37U);
+  EXPECT_EQ(converter->in_pix, "NV12");
+  EXPECT_EQ(converter->out_pix, "P010");
+}
+
 TEST(BuiltinOperatorsTest, CompositeFactoryOrderAndFallthrough) {
   ge::BuiltinOperatorFactory a, b;
   a.Register(Desc("Same@1.0.0", {}, {}), [](const ge::OperatorCreateArgs&) { return std::make_unique<Probe>(); });

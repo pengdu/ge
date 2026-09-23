@@ -258,6 +258,54 @@ TEST(MixTest, MemberJoinsAndLeavesWhileOutputKeepsRunning) {
   EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
 }
 
+TEST(MixTest, FourMemberBaselineSupportsDynamicJoinAndLeave) {
+  Fixture f("four_members");
+  const std::string a = f.Input("a", 180);
+  const std::string b = f.Input("b", 180);
+  const std::string c = f.Input("c", 180);
+  const std::string d = f.Input("d", 180);
+  const std::string e = f.Input("e", 180);
+  LayoutSpec layout;
+  layout.width = 640;
+  layout.height = 360;
+  MixOptions options;
+  const MixResultSpec result = f.Result("mix", "flv");
+  std::vector<MixSpec> members = {
+      f.Member("alice", a), f.Member("bob", b), f.Member("carol", c), f.Member("dave", d)};
+  auto g = MixTemplate::Graph(layout, options, members, result);
+  ASSERT_TRUE(g.ok()) << g.status().ToString();
+  auto s = f.engine->CreateSession(*g);
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ge::Session* session = *s;
+  MixController ctl(*f.engine, *session, layout, options, members);
+  ASSERT_TRUE(session->Start().ok());
+  while (f.PacketsOut(session, "venc") < 20) f.Turns(session, 1);
+
+  auto join = ctl.AddMember(f.Member("erin", e));
+  ASSERT_TRUE(join.ok()) << join.status().ToString();
+  auto joined = ctl.Wait(*join, std::chrono::seconds(20));
+  ASSERT_TRUE(joined.ok()) << joined.status().ToString();
+  EXPECT_EQ(joined->state, ge::OperationState::kSucceeded) << joined->result.ToString();
+  EXPECT_EQ(ctl.Members().size(), 5U);
+  EXPECT_EQ(ctl.PortOf("erin"), "s4");
+
+  while (f.PacketsOut(session, "venc") < 50) f.Turns(session, 1);
+  auto leave = ctl.RemoveMember("bob");
+  ASSERT_TRUE(leave.ok()) << leave.status().ToString();
+  auto left = ctl.Wait(*leave, std::chrono::seconds(20));
+  ASSERT_TRUE(left.ok()) << left.status().ToString();
+  EXPECT_EQ(left->state, ge::OperationState::kSucceeded) << left->result.ToString();
+  EXPECT_EQ(ctl.Members().size(), 4U);
+  EXPECT_TRUE(ctl.PortOf("bob").empty());
+
+  ASSERT_TRUE(f.RunToStop(session));
+  const ProbeResult out = Probe(result.output_path);
+  EXPECT_GT(out.video_packets, 80) << out.ToJson().Serialize();
+  EXPECT_TRUE(out.first_video_is_key);
+  EXPECT_TRUE(out.read_to_eof);
+  EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
+}
+
 TEST(MixTest, LayoutMoveAndGainAreHotUpdates) {
   Fixture f("hot");
   const std::string a = f.Input("a", 120);
