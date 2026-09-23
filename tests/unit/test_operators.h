@@ -76,6 +76,30 @@ inline CapabilityDescriptor Desc(const char* key, std::vector<PortCapability> in
   return d;
 }
 
+// A misbehaving operator that ignores the engine's stop request: holds every
+// Process call until |release| is set on the shared control, then reports
+// exhausted. Instances share the control so the test can release them all.
+class StuckSource final : public Operator {
+ public:
+  struct Control {
+    std::atomic<bool> release{false};
+    std::atomic<int> stuck_calls{0};
+  };
+  explicit StuckSource(std::shared_ptr<Control> control) : control_(std::move(control)) {}
+  Status Open(const OpenRequest&) override { return Status::Ok(); }
+  Result<ProcessResult> Process(const ProcessRequest&) override {
+    control_->stuck_calls.fetch_add(1, std::memory_order_relaxed);
+    while (!control_->release.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return ProcessResult::kExhausted;
+  }
+  Status Close(const CloseRequest&) override { return Status::Ok(); }
+
+ private:
+  std::shared_ptr<Control> control_;
+};
+
 // Emits |count| packets on "out" then reports exhausted.
 class CountingSource final : public Operator {
  public:

@@ -24,6 +24,10 @@ struct SessionManagerServices {
   OperationRegistry* operations = nullptr;
   AsyncRuntime* async = nullptr;
   ResourceLedger* ledger = nullptr;        // null when admission is off
+  // Fires when a forced stop did not close before its bounded wait (the
+  // pump-iteration limit on inline engines, 5s on threaded ones) or when the
+  // last session reference outlived the 5s teardown wait. Non-blocking.
+  std::function<void(SessionId)> on_stop_timeout;
   // PluginRegistry::operator_generation via the engine; template caches are
   // stamped with it (GM-3 / TD-01).
   std::function<std::uint64_t()> operator_generation;
@@ -76,6 +80,12 @@ class SessionManager final {
   // Removes the session from the map, stops it (blocking until closed) and
   // waits for the last reference to drop, so ~Session has released its plugin
   // leases by the time this returns (the caller's unload pass depends on it).
+  // INTERNAL if the session failed to close within the bounded wait: the
+  // session is gone from the map but still running -- it is quarantined
+  // (kept alive until the watchdog sees it stopped, so a wedged operator
+  // cannot pull ~Session into ~Scheduler's wait), an on_stop_timeout event is
+  // published, and the host must not assume a clean drain. Plugin leases stay
+  // held until the quarantine reclaims the session.
   [[nodiscard]] Status Destroy(SessionId id);
 
   void StopAll(bool fast);
@@ -86,7 +96,8 @@ class SessionManager final {
   // two separate calls.
   [[nodiscard]] std::vector<std::pair<SessionId, std::shared_ptr<Session>>> RefsWithIds() const;
 
-  // One watchdog pass: Tick every live session outside |mutex_|.
+  // One watchdog pass: Tick every live session outside |mutex_|, then
+  // reclaim quarantined sessions that have since stopped.
   void TickAll();
   // Shutdown only: drops the map without stopping (Engine stops first,
   // 13 §7.3: sessions before shared services).
@@ -96,6 +107,10 @@ class SessionManager final {
   [[nodiscard]] Result<Session*> CreateLocked(const GraphSpec& spec, CallerContext caller,
                                               OperationId* out_operation,
                                               std::shared_ptr<const ValidatedGraph> prevalidated);
+  // Drops references to quarantined sessions that have finished stopping.
+  // Called outside |mutex_|: dropping the last reference runs ~Session, which
+  // waits on scheduler condition variables and must not hold this lock.
+  void ReclaimStopped();
 
   SessionManagerServices services_;
   const EngineConfig& config_;
@@ -103,6 +118,9 @@ class SessionManager final {
 
   mutable std::mutex mutex_;
   std::map<SessionId, std::shared_ptr<Session>> sessions_;
+  // Destroy-timeout survivors: still running, kept alive so their (possibly
+  // wedged) operators finish on their own; reclaimed by ReclaimStopped().
+  std::vector<std::shared_ptr<Session>> quarantined_;
   SessionId next_session_id_ = 1;
 };
 

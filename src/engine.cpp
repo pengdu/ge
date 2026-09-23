@@ -302,6 +302,16 @@ Engine::Engine(EngineConfig config)
   ss.async = async_.get();
   ss.ledger = ledger_.get();
   ss.operator_generation = [this] { return plugins_->operator_generation(); };
+  ss.on_stop_timeout = [this](SessionId id) {
+    PublishSessionEvent(id, "session_stop_timeout", Severity::kError, 0, JsonValue(JsonObject{}));
+    AuditRecord a;
+    a.operation = "session.stop_timeout";
+    a.target = "session:" + std::to_string(id);
+    a.session_id = id;
+    a.result = GE_STATUS_INTERNAL;
+    a.message = "forced stop did not close within the bounded wait";
+    audit_.Append(std::move(a));
+  };
   sessions_ = std::make_unique<SessionManager>(
       std::move(ss), config_,
       [this](SessionId id, CallerContext caller) { return MakeSessionEvents(id, std::move(caller)); });

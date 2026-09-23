@@ -13,6 +13,12 @@ namespace {
 // Inline executors need the host to advance the machinery; a blocking wait
 // would spin forever because nothing else pumps it.
 constexpr int kInlineSpinLimit = 100000;
+// Threaded engines let the executor/async workers finish the stop; bounded so
+// a wedged operator cannot hang Destroy forever.
+constexpr auto kThreadedStopWait = std::chrono::milliseconds(5000);
+// Last-chance wait for every shared_ptr<Session> holder (watchdog snapshots)
+// to drop after the session left the map.
+constexpr auto kTeardownWait = std::chrono::seconds(5);
 
 }  // namespace
 
@@ -108,7 +114,13 @@ Status SessionManager::Destroy(SessionId id) {
     sessions_.erase(it);
   }
   const SessionState st = s->state();
-  if (st != SessionState::kStopped && st != SessionState::kCreated) {
+  // A failed session still gets its Stop call (the session.stop operation and
+  // audit record come from Session::Stop) but is always safe to drop: the
+  // scheduler closed everything when the node failed. Only a stopping/running
+  // session can still hold a wedged Process.
+  const bool failed = st == SessionState::kFailed;
+  bool closed_cleanly = st == SessionState::kStopped || st == SessionState::kCreated;
+  if (!closed_cleanly) {
     (void)s->Stop(true);
     if (config_.cpu_threads == 0) {
       for (int i = 0; i < kInlineSpinLimit && !s->WaitStopped(std::chrono::milliseconds(0)); ++i) {
@@ -116,20 +128,63 @@ Status SessionManager::Destroy(SessionId id) {
         if (!services_.async->options().worker_thread) (void)services_.async->Pump();
         s->Tick();
       }
+      closed_cleanly = failed || s->WaitStopped(std::chrono::milliseconds(0));
     } else {
-      (void)s->WaitStopped(std::chrono::milliseconds(5000));
+      closed_cleanly = failed || s->WaitStopped(kThreadedStopWait);
     }
+  }
+  if (!closed_cleanly) {
+    // Quarantine instead of dropping: a wedged operator's in-flight task is
+    // still inside Process, and ~Scheduler waits for it -- destroying here
+    // would hang Destroy (the old silent path never returned either). Keep
+    // the session alive until it stops on its own (ReclaimStopped); plugin
+    // leases stay held until then, so a pending unload keeps waiting too.
+    {
+      std::lock_guard lock(mutex_);
+      quarantined_.push_back(std::move(s));
+    }
+    if (services_.on_stop_timeout) services_.on_stop_timeout(id);
+    return Status::Internal("session " + std::to_string(id) +
+                            " did not stop within the bounded wait; quarantined until it closes");
   }
   // The watchdog's Tick() may still hold a snapshot reference; the plugin
   // leases are only released by ~Session, and the caller's follow-up unload
   // pass must observe that, so wait for the last reference to drop.
   std::weak_ptr<Session> weak = s;
   s.reset();
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  const auto deadline = std::chrono::steady_clock::now() + kTeardownWait;
   while (!weak.expired() && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  const bool references_dropped = weak.expired();
+  if (!references_dropped && services_.on_stop_timeout) {
+    services_.on_stop_timeout(id);
+  }
+  if (!references_dropped) {
+    return Status::Internal("session " + std::to_string(id) +
+                            " references did not drop within " + std::to_string(kTeardownWait.count()) + "s");
+  }
   return Status::Ok();
+}
+
+void SessionManager::ReclaimStopped() {
+  std::vector<std::shared_ptr<Session>> still_running;
+  {
+    std::lock_guard lock(mutex_);
+    still_running.swap(quarantined_);
+  }
+  std::vector<std::shared_ptr<Session>> wedged;
+  for (std::shared_ptr<Session>& s : still_running) {
+    if (s->state() == SessionState::kStopped) {
+      s.reset();  // stopped: no in-flight task can hold ~Scheduler open
+    } else {
+      wedged.push_back(std::move(s));
+    }
+  }
+  if (!wedged.empty()) {
+    std::lock_guard lock(mutex_);
+    quarantined_.insert(quarantined_.end(), wedged.begin(), wedged.end());
+  }
 }
 
 void SessionManager::StopAll(bool fast) {
@@ -140,6 +195,7 @@ void SessionManager::StopAll(bool fast) {
     (void)s->Stop(fast);
   }
   for (const auto& s : sessions) {
+    bool closed_cleanly = false;
     if (config_.cpu_threads == 0) {
       for (int i = 0; i < kInlineSpinLimit && !s->WaitStopped(std::chrono::milliseconds(0)); ++i) {
         (void)s->PumpMutations();
@@ -147,8 +203,12 @@ void SessionManager::StopAll(bool fast) {
         if (!services_.async->options().worker_thread) (void)services_.async->Pump();
         s->Tick();
       }
+      closed_cleanly = s->WaitStopped(std::chrono::milliseconds(0));
     } else {
-      (void)s->WaitStopped(std::chrono::milliseconds(5000));
+      closed_cleanly = s->WaitStopped(kThreadedStopWait);
+    }
+    if (!closed_cleanly && services_.on_stop_timeout) {
+      services_.on_stop_timeout(s->id());
     }
   }
 }
@@ -178,11 +238,17 @@ std::vector<std::pair<SessionId, std::shared_ptr<Session>>> SessionManager::Refs
 
 void SessionManager::TickAll() {
   for (const std::shared_ptr<Session>& s : Refs()) s->Tick();
+  ReclaimStopped();
 }
 
 void SessionManager::Clear() {
   std::lock_guard lock(mutex_);
   sessions_.clear();
+  // Quarantined sessions too: their wedged operators never finish, so the
+  // references simply drop here at shutdown (the on_stop_timeout events
+  // already reported them). ~Session may still block on ~Scheduler's wait --
+  // engine shutdown cannot outlive a truly stuck operator.
+  quarantined_.clear();
 }
 
 }  // namespace ge

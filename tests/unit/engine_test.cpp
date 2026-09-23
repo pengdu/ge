@@ -13,6 +13,8 @@
 #include <ge/c/ge_engine.h>
 #include <ge/cpp/graph_spec_json.h>
 
+#include "test_operators.h"
+
 // Defined in src/c_api.cpp; not exported, not in the public headers. Lets the
 // C API tests drive the C++ side of a session the C API created.
 ge::Engine* ge_engine_for_testing(ge_engine_handle engine);
@@ -420,6 +422,83 @@ TEST(EngineTest, DestructorStopsRunningSessionsAndReleasesPlugins) {
     EXPECT_EQ((*s)->state(), ge::SessionState::kRunning);
   }
   EXPECT_EQ(pool->stats().live_buffers, 0U);
+}
+
+// A misbehaving operator (StuckSource holds Process until released) turns
+// DestroySession's bounded stop wait into a timeout. The contract being
+// pinned here (previously silent): the call reports INTERNAL, publishes a
+// session_stop_timeout event and an audit record, and the session is gone
+// from the map -- the host knows the drain failed and must not assume a
+// clean shutdown.
+TEST(EngineTest, DestroySessionTimesOutLoudlyWhenStopIsIgnored) {
+  auto factory = std::make_shared<ge::BuiltinOperatorFactory>();
+  auto control = std::make_shared<ge::test::StuckSource::Control>();
+  auto collector = std::make_shared<ge::test::Collector>();
+  factory->Register(
+      ge::test::Desc("Stuck@1.0.0", {},
+                     {ge::test::BytesPort("out", ge::PortDirection::kOutput, true, ge::PortCardinality::kMulti)},
+                     true, 1),
+      [control](const ge::OperatorCreateArgs&) {
+        return std::make_unique<ge::test::StuckSource>(control);
+      });
+  factory->Register(ge::test::Desc("Sink@1.0.0", {ge::test::BytesPort("in", ge::PortDirection::kInput)}, {}),
+                    [collector](const ge::OperatorCreateArgs&) {
+                      return std::make_unique<ge::test::Shared<ge::test::Collector>>(collector);
+                    });
+
+  ge::EngineConfig c;
+  c.cpu_threads = 2;
+  c.watchdog_thread = false;
+  c.builtin_operators = factory;
+  auto engine = ge::Engine::Create(c);
+  ASSERT_TRUE(engine.ok());
+  ge::Engine& e = **engine;
+
+  std::atomic<int> timeouts{0};
+  std::atomic<bool> stopped{false};
+  const ge::SubscriptionId sub = e.events().Subscribe(
+      ge::EventFilter{.types = {"session_stop_timeout", "session_state"}},
+      [&](const ge::Event& ev) {
+        if (ev.type == "session_stop_timeout") {
+          EXPECT_EQ(ev.session, 1U);
+          timeouts.fetch_add(1, std::memory_order_relaxed);
+        } else if (ev.session == 1U && ev.detail.GetString("to").value_or("") == "stopped") {
+          stopped.store(true, std::memory_order_relaxed);
+        }
+      });
+
+  ge::GraphBuilder g("stuck");
+  auto src = g.AddNode(Op("Stuck@1.0.0"), "src");
+  auto sink = g.AddNode(Op("Sink@1.0.0"), "sink");
+  g.Connect(src.port("out"), sink.port("in"), {.id = "e0"});
+  auto s = e.CreateSession(*g.Build());
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ASSERT_TRUE((*s)->Start().ok());
+  // Let the executor enter the stuck Process before destroying.
+  while (control->stuck_calls.load(std::memory_order_relaxed) == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  const ge::Status destroy = e.DestroySession((*s)->id());
+  EXPECT_EQ(destroy.code(), GE_STATUS_INTERNAL) << destroy.ToString();
+  EXPECT_TRUE(e.Sessions().empty());
+  EXPECT_EQ(timeouts.load(), 1);
+  ge::AuditFilter f;
+  f.operation = "session.stop_timeout";
+  const auto records = e.audit().Query(f);
+  ASSERT_EQ(records.size(), 1U);
+  EXPECT_EQ(records[0].session_id, 1U);
+
+  control->release.store(true, std::memory_order_relaxed);
+  // Let the operator return and the quarantined session reach stopped before
+  // engine teardown drops its last reference (Clear frees the quarantine).
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!stopped.load(std::memory_order_relaxed) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(stopped.load());
+  e.events().Cancel(sub);
 }
 
 // Lock-order canary ahead of the Engine split: today the only legal order is
