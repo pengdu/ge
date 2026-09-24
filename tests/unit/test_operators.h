@@ -447,28 +447,49 @@ class VideoCountSource final : public Operator {
 // |key_seq|. The order matters: the candidate names |detail_seq|, emitted on
 // "out" last, so an earlier emit on another port must leave it staged. Keying
 // on seq alone would consume it on whichever port matched first.
+//
+// |repeat| publishes the same detail more than once before the emit
+// (Review Focus #4: a duplicate publication must still mirror exactly one
+// event Packet per edge). |pre_seqs| emits plain (non-keyframe) data packets
+// on "out" before the first hook runs, so a fan-out test can wedge a
+// capacity-1 block edge before the publish: the hook runs after them, so
+// waiting on the consumer there proves the edge is full for the event and the
+// keyframe that follow.
 class FormatAnnouncer final : public Operator {
  public:
   explicit FormatAnnouncer(PacketSeq key_seq, PacketSeq detail_seq, bool keyframe = true,
                            std::vector<std::function<void()>> hooks = {}, PacketSeq out2_seq = 0,
-                           PacketSeq bytes_seq = 0)
+                           PacketSeq bytes_seq = 0, int repeat = 1,
+                           std::vector<PacketSeq> pre_seqs = {})
       : key_seq_(key_seq),
         detail_seq_(detail_seq),
         keyframe_(keyframe),
         hooks_(std::move(hooks)),
         out2_seq_(out2_seq),
-        bytes_seq_(bytes_seq) {}
+        bytes_seq_(bytes_seq),
+        repeat_(repeat),
+        pre_seqs_(std::move(pre_seqs)) {}
   Status Open(const OpenRequest&) override { return Status::Ok(); }
   Result<ProcessResult> Process(const ProcessRequest& req) override {
     if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
     if (done_) return ProcessResult::kExhausted;
     done_ = true;
+    for (const PacketSeq s : pre_seqs_) {
+      Packet p;
+      p.header.seq = s;
+      p.header.pts_ns = static_cast<std::int64_t>(s);
+      p.header.flags = 0;  // plain data: must not touch any staged candidate
+      p.header.type_tag = TypeTagRegistry::Global().Intern("VideoFrame");
+      if (const Status st = req.sink->Emit("out", std::move(p)); !st.ok()) return st;
+    }
     Hook();
     if (req.events != nullptr) {
-      JsonObject d;
-      d.emplace("first_key_seq", JsonValue(static_cast<std::uint64_t>(detail_seq_)));
-      d.emplace("pixel_format", JsonValue("NV12"));
-      req.events->Publish("media_format_changed", Severity::kInfo, JsonValue(std::move(d)));
+      for (int i = 0; i < repeat_; ++i) {
+        JsonObject d;
+        d.emplace("first_key_seq", JsonValue(static_cast<std::uint64_t>(detail_seq_)));
+        d.emplace("pixel_format", JsonValue("NV12"));
+        req.events->Publish("media_format_changed", Severity::kInfo, JsonValue(std::move(d)));
+      }
     }
     if (bytes_seq_ != 0) {
       if (const Status s = req.sink->Emit("bytes", MakeKeyframe(bytes_seq_, "Bytes")); !s.ok()) {
@@ -479,10 +500,15 @@ class FormatAnnouncer final : public Operator {
       if (const Status s = req.sink->Emit("out2", MakeKeyframe(out2_seq_)); !s.ok()) return s;
     }
     Hook();
-    return req.sink->Emit("out", MakeKeyframe(key_seq_));
+    // Not `return req.sink->Emit(...)`: Emit returns Status, and an OK Status
+    // fed to Result<ProcessResult> becomes INTERNAL ("Result constructed from
+    // OK status without value"), which failed the node after a successful
+    // call and silently ate the EOS -- any test that waits for the graph to
+    // close would hang on that.
+    if (const Status s = req.sink->Emit("out", MakeKeyframe(key_seq_)); !s.ok()) return s;
+    return ProcessResult::kContinue;  // next call reports kExhausted
   }
   Status Close(const CloseRequest&) override { return Status::Ok(); }
-
  private:
   Packet MakeKeyframe(PacketSeq seq, const char* tag = "VideoFrame") const {
     Packet p;
@@ -503,15 +529,24 @@ class FormatAnnouncer final : public Operator {
   std::size_t next_hook_ = 0;
   PacketSeq out2_seq_ = 0;
   PacketSeq bytes_seq_ = 0;
+  int repeat_ = 1;
+  std::vector<PacketSeq> pre_seqs_;
   bool done_ = false;
 };
 
 // Records events and data separately, in arrival order, with the port each
 // arrived on. Unlike Collector it keeps event packets in the same list, so a
 // test can assert the event/record relative order that the in-band mirror
-// promises.
+// promises. |calls| counts non-flush Process invocations, so a sync test can
+// assert how many batches were produced, not just which packets arrived.
+//
+// Constructed gated, it blocks inside Process (after counting |entered|,
+// before recording) until Release() -- the deterministic way to keep a
+// capacity-1 block edge full while a producer emits behind it. Same
+// contract as Gate: Release() opens it permanently.
 class EventAwareCollector final : public Operator {
  public:
+  explicit EventAwareCollector(bool gated = false) : gated_(gated) {}
   struct Entry {
     PacketSeq seq;
     bool event;
@@ -522,6 +557,11 @@ class EventAwareCollector final : public Operator {
   Status Open(const OpenRequest&) override { return Status::Ok(); }
   Result<ProcessResult> Process(const ProcessRequest& req) override {
     if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
+    if (gated_) {
+      std::unique_lock lock(gate_mutex_);
+      ++entered;
+      gate_cv_.wait(lock, [this] { return open_; });
+    }
     std::lock_guard lock(mutex_);
     for (std::size_t i = 0; i < req.inputs.size(); ++i) {
       entries.push_back({req.inputs[i]->header.seq, req.inputs[i]->is_event(),
@@ -529,6 +569,7 @@ class EventAwareCollector final : public Operator {
                          req.inputs[i]->header.topology_version,
                          req.inputs[i]->header.parameter_version});
     }
+    ++calls;
     return ProcessResult::kContinue;
   }
   Status Close(const CloseRequest&) override { return Status::Ok(); }
@@ -536,8 +577,21 @@ class EventAwareCollector final : public Operator {
     std::lock_guard lock(mutex_);
     return entries;
   }
+  void Release() {
+    {
+      std::lock_guard lock(gate_mutex_);
+      open_ = true;
+    }
+    gate_cv_.notify_all();
+  }
+  std::atomic<int> entered{0};
+  std::atomic<int> calls{0};
 
  private:
+  bool gated_ = false;
+  std::mutex gate_mutex_;
+  std::condition_variable gate_cv_;
+  bool open_ = false;
   mutable std::mutex mutex_;
   std::vector<Entry> entries;
 };
@@ -559,7 +613,9 @@ inline void RegisterFormatAnnouncerFixture(BuiltinOperatorFactory& factory,
                                            PacketSeq out2_seq = 0,
                                            std::vector<std::function<void()>> hooks = {},
                                            bool opaque_output = false,
-                                           PacketSeq bytes_seq = 0) {
+                                           PacketSeq bytes_seq = 0,
+                                           int repeat = 1,
+                                           std::vector<PacketSeq> pre_seqs = {}) {
   std::vector<PortCapability> outs{
       VideoPort("out", PortDirection::kOutput, {"NV12"}, PortCardinality::kMulti)};
   if (opaque_output) {
@@ -569,10 +625,11 @@ inline void RegisterFormatAnnouncerFixture(BuiltinOperatorFactory& factory,
     outs.push_back(VideoPort("out2", PortDirection::kOutput, {"NV12"}, PortCardinality::kMulti));
   }
   factory.Register(Desc("Announce@1.0.0", {}, std::move(outs), true, 1),
-                   [&keep, key_seq, detail_seq, keyframe, out2_seq, hooks, bytes_seq](
-                       const OperatorCreateArgs&) {
+                   [&keep, key_seq, detail_seq, keyframe, out2_seq, hooks, bytes_seq, repeat,
+                    pre_seqs](const OperatorCreateArgs&) {
                      return Keep(keep, std::make_shared<FormatAnnouncer>(
-                                           key_seq, detail_seq, keyframe, hooks, out2_seq, bytes_seq));
+                                           key_seq, detail_seq, keyframe, hooks, out2_seq,
+                                           bytes_seq, repeat, pre_seqs));
                    });
   // "in" is required (the video leg of every fixture graph); "in2" is optional
   // so a two-video test can wire the sibling, and the opaque leg is optional.
@@ -587,6 +644,23 @@ inline void RegisterFormatAnnouncerFixture(BuiltinOperatorFactory& factory,
                      *collector = c.get();
                      return Keep(keep, std::move(c));
                    });
+}
+
+// Registers a video-formatted producer/consumer pair for EVT-4 tests. The
+// ports carry VideoConstraints so the negotiated contract has a video
+// format and IsVideoRoute() is true, with no media build required.
+// |detail_seq| differs from the announced keyframe seq in the negative
+// cases; |repeat| publishes the same detail more than once. Thin wrapper:
+// RegisterFormatAnnouncerFixture stays the single registration path, this
+// is just the short spelling for the common positive-shape tests.
+inline void RegisterFormatEventPair(BuiltinOperatorFactory& factory,
+                                    std::vector<std::shared_ptr<Operator>>& keep,
+                                    EventAwareCollector** sink, PacketSeq key_seq,
+                                    PacketSeq detail_seq, int repeat = 1) {
+  RegisterFormatAnnouncerFixture(factory, keep, key_seq, detail_seq, sink,
+                                 /*keyframe=*/true, /*two_video_outputs=*/false,
+                                 /*out2_seq=*/0, /*hooks=*/{}, /*opaque_output=*/false,
+                                 /*bytes_seq=*/0, repeat);
 }
 
 // A video source with one video output ("out", NV12+P010, multi) and one
