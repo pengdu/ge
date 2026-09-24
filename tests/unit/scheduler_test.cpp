@@ -817,11 +817,13 @@ TEST(SchedulerTest, FormatEventMirrorsWithoutASideBandSubscriber) {
   EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 0U);
 }
 
-// EVT-4 (Ruling 1): the candidate is bound to the output port whose keyframe
-// matches it, not to the seq alone. The sibling video port emits a keyframe
-// carrying the *bound seq* first, so seq-only keying would consume the
-// candidate there and replay the event onto a port that does not carry the
-// format change. This is the in-task guard for the `video_port` gate.
+// EVT-4 (Ruling 1): an event mirrored on one output port must not appear on a
+// sibling video output of the same node. "out2" emits a keyframe at seq 99 while
+// the candidate is bound to seq 7 on "out", so the mirror has to stay on "out".
+// Note this test cannot discriminate the `video_port` gate: with two video
+// outputs, either port satisfies a *port-kind* predicate, so seq-only keying
+// passes here too. SchedulerTest.OpaqueOutputDoesNotConsumeTheCandidate is the
+// guard for that gate; this one pins the fan-out contract.
 TEST(SchedulerTest, SiblingVideoOutputDoesNotGetTheEvent) {
   ge::BuiltinOperatorFactory factory;
   std::vector<std::shared_ptr<ge::Operator>> keep;
