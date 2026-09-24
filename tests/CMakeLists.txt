@@ -96,6 +96,7 @@ ge_add_unit_test (ge_session_test unit/session_test.cpp)
 ge_add_unit_test (ge_mutation_stress_test unit/mutation_stress_test.cpp)
 ge_add_unit_test (ge_async_runtime_test unit/async_runtime_test.cpp)
 ge_add_unit_test (ge_builtin_operators_test unit/builtin_operators_test.cpp)
+ge_add_unit_test (ge_plugin_event_test unit/plugin_event_test.cpp)
 
 # Inference scene library (ge_infer).
 ge_add_unit_test (ge_flow_limiter_test unit/flow_limiter_test.cpp)

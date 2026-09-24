@@ -41,9 +41,12 @@ class HostApiAdapter final {
   [[nodiscard]] static const ge_host_api& vtable() noexcept;
   [[nodiscard]] void* host_context() noexcept { return this; }
 
-  // Scope of one synchronous process call.
+  // Scope of one synchronous process call. |events| is the same call's event
+  // sink (normally the scheduler's), and defaults to null for a scope with no
+  // scheduler behind it: an event_publish then stays on the session-services
+  // path below.
   struct InvokeScope {
-    InvokeScope(HostApiAdapter& adapter, EmitSink& sink) noexcept;
+    InvokeScope(HostApiAdapter& adapter, EmitSink& sink, EventSink* events = nullptr) noexcept;
     ~InvokeScope();
     InvokeScope(const InvokeScope&) = delete;
     InvokeScope& operator=(const InvokeScope&) = delete;

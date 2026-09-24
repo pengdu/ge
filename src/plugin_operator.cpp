@@ -15,6 +15,10 @@ constexpr std::uint64_t kAdapterMagic = 0x47454841444150ull;  // "GEHADAP"
 struct Invoke {
   HostApiAdapter* adapter = nullptr;
   EmitSink* sink = nullptr;
+  // EVT-4: the event sink of the same call, so a plugin's event_publish goes
+  // through the same path as a built-in operator's req.events and can be
+  // mirrored in-band. Null for a scope that has no scheduler behind it.
+  EventSink* events = nullptr;
   bool exhausted = false;
 };
 
@@ -160,8 +164,9 @@ HostApiAdapter* HostApiAdapter::From(void* host_context) noexcept {
   return (a != nullptr && a->magic_ == kAdapterMagic) ? a : nullptr;
 }
 
-HostApiAdapter::InvokeScope::InvokeScope(HostApiAdapter& adapter, EmitSink& sink) noexcept
-    : adapter_(adapter), context_(new Invoke{&adapter, &sink, false}) {
+HostApiAdapter::InvokeScope::InvokeScope(HostApiAdapter& adapter, EmitSink& sink,
+                                         EventSink* events) noexcept
+    : adapter_(adapter), context_(new Invoke{&adapter, &sink, events, false}) {
   adapter_.current_ = context_;
   g_current_invoke = static_cast<Invoke*>(context_);
 }
@@ -378,6 +383,23 @@ ge_status HostApiAdapter::EventPublish(const ge_event* event) {
   if (!HeaderOk(event, sizeof(ge_event)) || event->type == nullptr) {
     return MakeStatus(Status::InvalidArgument("invalid event"));
   }
+  // Inside a process call the event belongs to the call's node: hand it to the
+  // scheduler's event sink, which publishes the side-band copy and (for a
+  // bound format event) stages the in-band mirror. Outside a call --
+  // open/close, or an async worker after the call returned -- there is no such
+  // sink, and the session services below stay the only path.
+  if (Invoke* inv = g_current_invoke; inv != nullptr && inv->events != nullptr) {
+    // The sink takes a parsed value, so the conversion Engine used to do for
+    // this path happens here. An absent or empty detail is an empty object,
+    // and (like Engine) a detail that fails to parse is not an error.
+    JsonValue detail(JsonObject{});
+    if (event->detail_json != nullptr && event->detail_json[0] != '\0') {
+      JsonParseResult parsed = ParseJson(event->detail_json);
+      if (parsed.ok()) detail = std::move(*parsed.value);
+    }
+    inv->events->Publish(event->type, static_cast<Severity>(event->severity), std::move(detail));
+    return OkStatus();
+  }
   const HostServices services = SessionServices::Global().Find(event->session_id);
   if (!services.event_publish) return MakeStatus(Status::NotFound("no event sink for session"));
   services.event_publish(*event);
@@ -469,7 +491,7 @@ Result<ProcessResult> PluginOperator::Process(const ProcessRequest& request) {
     ports[i] = port_storage[i].c_str();
   }
   const std::string parameters = request.parameters != nullptr ? request.parameters->Serialize() : "{}";
-  HostApiAdapter::InvokeScope scope(*adapter_, *request.sink);
+  HostApiAdapter::InvokeScope scope(*adapter_, *request.sink, request.events);
   ge_process_request req{};
   req.header.struct_size = sizeof(ge_process_request);
   req.header.abi_major = GE_ABI_MAJOR;
