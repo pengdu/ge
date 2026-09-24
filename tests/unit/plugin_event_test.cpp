@@ -238,4 +238,90 @@ TEST(PluginEventTest, InScopePublishIsAttributedToTheCallingNodeNotTheSpoofedIds
   EXPECT_EQ(spoofed.count, 0) << "the spoofed session's services must never fire in scope";
 }
 
+// Review fix round (mutant 5): the one line that wires the whole feature up
+// for real .so plugins is PluginOperator::Process constructing its
+// InvokeScope with request.events. Everything above drives HostApiAdapter
+// directly, so a revert of that call site to the two-argument form survived
+// every test. This one pins it through the real chain -- a hand-built
+// ge_operator_vtable (PluginOperator::Create takes it directly; no .so, no
+// dlopen) whose process callback publishes through the host api it was
+// handed at create. The fake plugin publishes with the *registered* session
+// id, so under the two-argument mutant the publish still succeeds -- onto
+// the session-services recorder instead of the request's EventSink -- and
+// the test fails on routing, not on an incidental NotFound.
+struct FakePlugin {
+  const ge_host_api* api = nullptr;
+  void* host_context = nullptr;
+  ge_status last_publish{};
+  int process_calls = 0;
+};
+
+ge_status FakeCreate(const ge_operator_create_args* args, ge_operator_handle* out) {
+  auto* p = new FakePlugin;
+  p->api = args->host_api;
+  p->host_context = args->host_context;
+  *out = reinterpret_cast<ge_operator_handle>(p);
+  return ge::OkStatus();
+}
+ge_status FakeOpen(ge_operator_handle, const ge_open_request*) { return ge::OkStatus(); }
+ge_status FakeProcess(ge_operator_handle op, const ge_process_request* req) {
+  auto* p = reinterpret_cast<FakePlugin*>(op);
+  ++p->process_calls;
+  const ge_event ev = FormatEvent(req->session_id, /*node=*/0, R"({"first_key_seq":7})");
+  p->last_publish = p->api->event_publish(&ev);
+  return ge::OkStatus();
+}
+ge_status FakeClose(ge_operator_handle, const ge_close_request*) { return ge::OkStatus(); }
+void FakeDestroy(ge_operator_handle op) { delete reinterpret_cast<FakePlugin*>(op); }
+
+TEST(PluginEventTest, RealPluginProcessRoutesPublishToTheRequestEventSink) {
+  ge_operator_vtable vt{};
+  vt.header.struct_size = sizeof(ge_operator_vtable);
+  vt.header.abi_major = GE_ABI_MAJOR;
+  vt.create = &FakeCreate;
+  vt.open = &FakeOpen;
+  vt.process = &FakeProcess;
+  vt.close = &FakeClose;
+  vt.destroy = &FakeDestroy;  // submit stays null: not a mandatory entry
+
+  HostRecorder rec;
+  ge::OperatorCreateArgs args;
+  args.key = Op("FakePlug@1.0.0");
+  args.node_id = 9;
+  args.external_id = "announce";
+  args.session_id = 88;
+  auto created = ge::PluginOperator::Create(vt, args, /*is_source=*/true,
+                                            RecordingServices(&rec), /*lease=*/nullptr);
+  ASSERT_TRUE(created.ok()) << created.status().ToString();
+  std::unique_ptr<ge::PluginOperator> op = std::move(*created);
+
+  ge::OpenRequest open;
+  open.session_id = 88;
+  ASSERT_TRUE(op->Open(open).ok());
+
+  RecordingEventSink events;
+  NullEmitSink emits;
+  ge::ProcessRequest req;
+  req.session_id = 88;
+  req.sink = &emits;
+  req.events = &events;  // what the scheduler sets on both source and process paths
+  const auto result = op->Process(req);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+
+  const auto* plugin = reinterpret_cast<const FakePlugin*>(op->handle());
+  ASSERT_EQ(plugin->process_calls, 1);
+  EXPECT_EQ(plugin->last_publish.code, GE_STATUS_OK);
+  ASSERT_EQ(events.entries.size(), 1U)
+      << "Process must hand request.events to its InvokeScope; a two-argument "
+         "scope silently downgrades every real plugin to side-band only";
+  EXPECT_EQ(events.entries[0].type, "media_format_changed");
+  EXPECT_EQ(events.entries[0].severity, ge::Severity::kWarning);
+  EXPECT_EQ(events.entries[0].detail.GetInteger("first_key_seq"), 7);
+  EXPECT_EQ(rec.count, 0) << "in scope, the session-services path must not fire";
+
+  ge::CloseRequest close;
+  close.session_id = 88;
+  EXPECT_TRUE(op->Close(close).ok());
+}
+
 }  // namespace
