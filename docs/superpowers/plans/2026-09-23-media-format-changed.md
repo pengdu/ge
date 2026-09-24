@@ -392,7 +392,7 @@ Expected: PASS.
 
 - [ ] **Step 7: Add the video-route predicate test**
 
-In `tests/unit/scheduler_test.cpp`, copy the `VideoPort` helper from `tests/unit/builtin_operators_test.cpp:27-37` into the file's anonymous namespace (keep `type_tag = "VideoFrame"` and the `p.video = ge::VideoConstraints{}` line — that optional is what `IsVideoRoute` reads). Then:
+Add the `VideoPort` helper to `tests/unit/test_operators.h` under `namespace ge::test`, moved from `tests/unit/builtin_operators_test.cpp:27-37` (that file then includes the shared one instead of keeping a private copy — one definition, not two). Keep `type_tag = "VideoFrame"` and the `p.video = ge::VideoConstraints{}` line: that optional is what `IsVideoRoute` reads. The test itself goes in `tests/unit/scheduler_test.cpp`:
 
 ```cpp
 TEST(SchedulerTest, OnlyVideoContractsCountAsVideoRoutes) {
@@ -417,7 +417,7 @@ TEST(SchedulerTest, OnlyVideoContractsCountAsVideoRoutes) {
 }
 ```
 
-This needs `VSrc` (video out) and `VSink` (video in) registered in `Fixture`, plus a `bytes` output on `VSrc`. Task 4 Step 1 adds a shared registration helper; this test may add a local `RegisterVideoFixture(factory, keep)` and Task 4 may then reuse or replace it — do not duplicate the registration in two places, move it to `test_operators.h` when Task 4 needs it.
+This needs `VSrc` (video out, plus a `bytes` output carrying an opaque contract) and `VSink` (video in). Add a shared `RegisterVideoFixture(ge::BuiltinOperatorFactory& factory, std::vector<std::shared_ptr<ge::Operator>>& keep)` to `tests/unit/test_operators.h` in this step and use it here; `scheduler_test.cpp`'s own `Fixture` registers it in its constructor. Task 4 reuses the helper rather than registering a second copy.
 
 - [ ] **Step 8: Run it**
 
@@ -442,6 +442,12 @@ it."
 
 ### Task 3: `Sink` mirrors the format event ahead of its keyframe
 
+**Candidate keying (pre-flight ruling):** a staged candidate is bound to the output
+port whose keyframe matches it, not to the seq alone. `Sink::Emit` passes its `port`
+into the lookup, and only a keyframe emitted on a *video* route of that port consumes
+it. Keying on seq alone would replay the event onto a sibling video output that
+happens to emit the same seq — exactly the case Task 4 Step 4 exists to prevent.
+
 **Files:**
 - Modify: `src/scheduler_internal.h:15-63` (`Scheduler::Sink`)
 - Modify: `src/scheduler_invoke.cpp` (nothing — `Sink` is constructed per call already)
@@ -453,7 +459,7 @@ it."
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `tests/unit/scheduler_test.cpp`. This needs a producer that both publishes a format event and emits its keyframe in the same call, and a collector that records events separately:
+Add to `tests/unit/test_operators.h`, under `namespace ge::test` (the shared header, so Task 4 does not have to move them later), then use them from `tests/unit/scheduler_test.cpp`. This needs a producer that both publishes a format event and emits its keyframe in the same call, and a collector that records events separately:
 
 ```cpp
 // Publishes "media_format_changed" bound to the next keyframe's seq, then
@@ -611,7 +617,21 @@ Add the pending type and member inside `Sink` (private):
   std::vector<PendingFormatEvent> pending_;
 ```
 
-- [ ] **Step 4: Inject in `Sink::Emit`**
+Staging is keyed on the seq the producer named; the *port* it belongs to is the port
+that emits the matching keyframe, so no port is recorded here.
+
+- [ ] **Step 4: Add the diagnostic counter**
+
+Step 7's negative-path test reads it, so it lands here rather than later. In
+`include/ge/cpp/node_runtime.h`, next to `orphan_completions` (`:125`):
+
+```cpp
+  // EVT-4: staged format events that never found their binding keyframe.
+  // Side-band publication is unaffected; this is the diagnostic count.
+  std::atomic<std::uint64_t> format_events_unmirrored{0};
+```
+
+- [ ] **Step 5: Inject in `Sink::Emit`**
 
 Replace `Sink::Emit` with a version that mirrors first, through the identical per-edge path. Factor the existing loop body into a lambda so the two packets cannot drift:
 
@@ -624,18 +644,27 @@ Replace `Sink::Emit` with a version that mirrors first, through the identical pe
     // decision, so a full block edge parks them in FIFO order and the
     // downstream never sees the keyframe first.
     const bool keyframe = (packet.header.flags & GE_PACKET_FLAG_KEYFRAME) != 0;
-    if (keyframe && !pending_.empty()) {
+    const std::vector<RouteEntry>* routes = keyframe ? topo_.RoutesFor(node_.id(), port) : nullptr;
+    // A keyframe only consumes a candidate when this port actually carries a
+    // video route: a data keyframe on an opaque output must not swallow an
+    // event bound to a video keyframe that has not been emitted yet, and a
+    // sibling video port must not replay it.
+    const bool video_port =
+        routes != nullptr && std::any_of(routes->begin(), routes->end(),
+                                         [](const RouteEntry& r) { return IsVideoRoute(r.contract); });
+    if (keyframe && video_port && !pending_.empty()) {
       const auto it = std::find_if(pending_.begin(), pending_.end(),
                                    [&](const PendingFormatEvent& p) { return p.seq == packet.header.seq; });
       if (it != pending_.end()) {
-        if (const Status s = PushOnRoutes(port, MakeFormatEventPacket(packet, kFormatEventType, it->detail));
+        const JsonValue detail = it->detail;
+        pending_.erase(it);  // one event Packet per keyframe, never two
+        if (const Status s = PushOnRoutes(port, MakeFormatEventPacket(packet, kFormatEventType, detail), true);
             !s.ok()) {
           return s;
         }
-        pending_.erase(it);  // one event Packet per keyframe, never two
       }
     }
-    return PushOnRoutes(port, std::move(packet));
+    return PushOnRoutes(port, std::move(packet), false);
   }
 
   // Records that a staged event never found its keyframe. Called once per
@@ -673,30 +702,44 @@ and the shared push path:
   }
 ```
 
-Note the `continue` on non-video routes: for the keyframe itself this must **not** skip — see Step 5.
+Note the `continue` on non-video routes: for the keyframe itself this must **not** skip — see Step 6.
 
-- [ ] **Step 5: Keep the keyframe's fan-out complete**
+- [ ] **Step 6: Keep the keyframe's fan-out complete**
 
-The predicate in Step 4 is right for the event and wrong for the keyframe: the keyframe must still reach every edge, video or not. Give `PushOnRoutes` a flag and pass `false` for the keyframe:
+The predicate in Step 5 is right for the event and wrong for the keyframe: the keyframe must still reach every edge, video or not. Give `PushOnRoutes` a flag and pass `false` for the keyframe:
 
 ```cpp
   Status PushOnRoutes(std::string_view port, Packet packet, bool video_only) {
-    ...
+    Result<PacketRef> shared = PacketRouter::Prepare(topo_, node_, port, std::move(packet), pv_);
+    if (!shared.ok()) return shared.status();
+    if (!*shared) return Status::Ok();
+    const std::vector<RouteEntry>* routes = topo_.RoutesFor(node_.id(), port);
+    EmitReport report;
     for (const RouteEntry& r : *routes) {
-      if (video_only && !IsVideoRoute(r.contract)) continue;
-      ...
+      if (video_only && !IsVideoRoute(r.contract)) continue;  // audio/tensor/opaque legs get the keyframe only
+      if (s_.HasParked(node_, *r.edge)) {
+        s_.Park(node_, *r.edge, *shared);
+        continue;
+      }
+      if (PacketRouter::PushOne(*r.edge, *shared, node_, &report) == PushOutcome::kWouldBlock) {
+        s_.Park(node_, *r.edge, *shared);
+      }
     }
+    s_.AfterEmit(report);
+    return Status::Ok();
   }
 ```
 
 with the two call sites reading `PushOnRoutes(port, MakeFormatEventPacket(...), /*video_only=*/true)` and `PushOnRoutes(port, std::move(packet), /*video_only=*/false)`.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+Both packets go through `Prepare` and therefore through `PushEdge` — the same `EmitReport` accounting the data path uses, and the same `packets_out` exclusion for control packets (`src/runtime_topology.cpp:247`).
+
+- [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cmake --build build -j && ctest --test-dir build -R ge_scheduler_test --output-on-failure`
 Expected: PASS, including the whole existing `SchedulerTest` suite (the keyframe fan-out change is what those tests police).
 
-- [ ] **Step 7: Add the negative-path test**
+- [ ] **Step 8: Add the negative-path test**
 
 Append a test asserting the event is *not* mirrored when the binding is wrong, and that the side-band copy still arrives:
 
@@ -715,18 +758,12 @@ TEST(SchedulerTest, UnboundFormatEventStaysSideBandOnly) {
 
 Fill it in with the same construction as Step 1, passing a `SchedulerEvents{.on_operator_event = ...}` that appends to `observed_events`, and a `FormatAnnouncer` constructed with `key_seq = 8` whose published detail still says `first_key_seq = 7`. Parameterize `FormatAnnouncer` with a second `detail_seq` member so both tests share one class instead of two, and add a third case in the same test that covers Review Focus #6 precisely: the detail binds to seq 7, the node emits seq 7 as *data* (no `GE_PACKET_FLAG_KEYFRAME`). Then assert the event is not mirrored even though a seq-7 packet exists — the binding is keyframe-specific, not seq-specific — that the side-band copy still arrives, and that `format_events_unmirrored` advanced once when the call ended.
 
-- [ ] **Step 8: Run it**
+- [ ] **Step 9: Run it**
 
 Run: `cmake --build build -j && ctest --test-dir build -R ge_scheduler_test --output-on-failure`
-Expected: PASS. If the counter assertion needs `NodeMetrics` to expose the field, add it in this step (`include/ge/cpp/node_runtime.h`, next to `orphan_completions`):
+Expected: PASS.
 
-```cpp
-  // EVT-4: staged format events that never found their binding keyframe.
-  // Side-band publication is unaffected; this is the diagnostic count.
-  std::atomic<std::uint64_t> format_events_unmirrored{0};
-```
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add src/scheduler_internal.h include/ge/cpp/node_runtime.h tests/unit/scheduler_test.cpp
@@ -751,18 +788,20 @@ silently dropped, and the side-band publication is unchanged."
 - Consumes: everything Task 3 produced; the `FormatAnnouncer` / `EventAwareCollector` pair from Task 3 Step 1 (move both into `tests/unit/test_operators.h` in this task so other suites can reuse them, and update Task 3's tests to include the header).
 - Produces: no production code. This task is the coverage half of the spec's §测试与验收.
 
-- [ ] **Step 1: Move the test doubles into the shared header**
+- [ ] **Step 1: Extend the shared helper**
 
-Move `FormatAnnouncer` and `EventAwareCollector` from `tests/unit/scheduler_test.cpp` into `tests/unit/test_operators.h` under `namespace ge::test`, renaming them `FormatAnnouncer` / `EventAwareCollector` (unchanged). Register them in a small fixture helper so three suites can build a video graph without repeating twenty lines:
+`FormatAnnouncer`, `EventAwareCollector`, `VideoPort` and `RegisterVideoFixture` already live in `tests/unit/test_operators.h` (Tasks 2 and 3 put them there). This task only extends `FormatAnnouncer` for the cases below and adds the one registration helper the fan-out tests share:
 
 ```cpp
 // Registers a video-formatted producer/consumer pair for EVT-4 tests. The
 // ports carry VideoConstraints so the negotiated contract has a video
 // format and IsVideoRoute() is true, with no media build required.
+// |detail_seq| differs from the announced keyframe seq in the negative
+// cases; |repeat| publishes the same detail more than once.
 inline void RegisterFormatEventPair(ge::BuiltinOperatorFactory& factory,
                                     std::vector<std::shared_ptr<ge::Operator>>& keep,
                                     EventAwareCollector** sink, ge::PacketSeq key_seq,
-                                    ge::PacketSeq detail_seq);
+                                    ge::PacketSeq detail_seq, int repeat = 1);
 ```
 
 - [ ] **Step 2: Write the fan-out test (Review Focus #5)**
@@ -845,20 +884,17 @@ TEST(FormatEventTest, PendingEventDoesNotCrossATopologySwap) {
 
 Drive the swap with the scheduler's `Publish(next, RetireRequest{...})` as the existing mutation tests in this file do; do not add new mutation machinery.
 
-- [ ] **Step 7: Write the plugin-entry test (Review Focus #3)**
+- [ ] **Step 7: Write the outside-scope plugin test (Review Focus #3, first half)**
 
-This one must not construct a real `.so`. Build a `HostApiAdapter` directly, which is what `PluginOperator` does (`src/plugin_operator.cpp:147`), and verify the two paths:
+Do not construct a real `.so`. Build a `HostApiAdapter` directly, which is what `PluginOperator` does (`src/plugin_operator.cpp:147`). This step owns only the path that must not change; Task 5 owns the in-scope path, which is where that code actually changes:
 
 ```cpp
-TEST(FormatEventTest, PluginPublishMirrorsOnlyInsideAnInvokeScope) {
-  // 1. Construct HostApiAdapter with HostServices capturing the published
-  //    events. Without an InvokeScope, event_publish must publish
-  //    side-band only and must not create an in-band Packet (the harness
-  //    Sink records zero emits).
-  // 2. Construct a HostApiAdapter::InvokeScope over a recording EventSink,
-  //    publish a bound format event, then Emit a keyframe with the same
-  //    seq. The recording sink must see Publish("media_format_changed")
-  //    exactly once and the emit path must produce the event Packet.
+TEST(FormatEventTest, PluginPublishOutsideAScopeStaysSideBandOnly) {
+  // Construct HostApiAdapter with HostServices capturing the published
+  // events. With no InvokeScope active, event_publish must publish
+  // side-band exactly once, with the same fields the pre-change code
+  // produced (session, node, severity, detail), and must not create an
+  // in-band Packet (a recording Sink stands ready and records zero emits).
 }
 ```
 
@@ -937,21 +973,22 @@ and outside an InvokeScope."
 
 Add a case that asserts the plugin path shares the operator path's outcome rather than duplicating it: publish through `host_api.event_publish` inside a scope whose `EventSink` is a real `Scheduler::Sink`, emit the matching keyframe through that same scope, and expect the same `[event, keyframe]` ordering a built-in producer produces.
 
+Write the test against the adapter's public surface (`vtable()`, `InvokeScope`, `Fill`) plus the session's `HostServices` — never by reaching into private members. Two assertions, both against a recording `EventSink` standing in for the scheduler's:
+
 ```cpp
-TEST(PluginEventTest, PublishInsideScopeReachesTheSchedulerSink) {
-  // Build a video graph whose producer is a SOURCE node, then stand in for
-  // the plugin: construct HostApiAdapter over it with HostServices captured
-  // from the session, open an InvokeScope on the scheduler's sink, and from
-  // inside the scope call ge_host_api::event_publish with a
-  // "media_format_changed" ge_event carrying first_key_seq = 7, then
-  // event_publish... no: then ge_host_api::emit the keyframe with seq 7.
-  // Assert:
-  //   - exactly one side-band event reached HostServices::event_publish;
-  //   - the consumer sees event(7) then keyframe(7).
+TEST(PluginEventTest, PublishInsideScopeReachesTheCallingEventSink) {
+  // (a) With an InvokeScope open over a recording EventSink, call
+  //     ge_host_api::event_publish with a "media_format_changed" ge_event
+  //     whose detail_json is {"first_key_seq":7}. The recording sink sees
+  //     Publish("media_format_changed", …) exactly once, and the detail it
+  //     receives is the parsed JSON (GetInteger("first_key_seq") == 7) —
+  //     not the raw string, which is what pins the ParseJson conversion.
+  // (b) With no scope active, the same call reaches HostServices::event_publish
+  //     exactly once and the recording sink sees nothing.
 }
 ```
 
-Comment syntax above is deliberate: write the test against the adapter's public surface (`vtable()`, `InvokeScope`, `Fill`) plus the session's `HostServices`, not by reaching into private members. If standing up a scheduler-backed sink from a unit test proves awkward, split this into two smaller assertions — (a) `EventPublish` inside a scope calls the scope's `EventSink::Publish` once with the parsed detail, (b) `EventPublish` with no active scope calls `HostServices::event_publish` once — and let Task 4's end-to-end case own the ordering claim.
+The end-to-end ordering claim (`[event(7), keyframe(7)]` through a real `Scheduler::Sink`) belongs to Task 4's harness, which already stands up that graph; standing one up here would duplicate it. If an end-to-end plugin case is cheap to add after (a) and (b) pass, add it — but do not let it block this task.
 
 - [ ] **Step 2: Run it to verify it fails**
 
