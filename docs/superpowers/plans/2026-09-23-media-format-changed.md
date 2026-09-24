@@ -601,7 +601,7 @@ Replace `Sink::Publish` with:
     // an event published outside a call (open/close) never reaches this
     // function at all, so no scope bookkeeping is needed.
     const std::optional<PacketSeq> seq = FormatEventMatchSeq(detail);
-    if (type == kFormatEventType && seq.has_value()) {
+    if (type == kFormatEventType && seq.has_value()) {  // the only mirrored type
       pending_.push_back(PendingFormatEvent{*seq, detail});
     }
     // The side-band publication is unchanged and must stay exactly one per
@@ -622,8 +622,9 @@ Add the pending type and member inside `Sink` (private):
   std::vector<PendingFormatEvent> pending_;
 ```
 
-Staging is keyed on the seq the producer named; the *port* it belongs to is the port
-that emits the matching keyframe, so no port is recorded here.
+Staging is keyed on the seq the producer named. The port is not recorded here: the
+port that emits the matching keyframe *is* the event's port, which is what keeps a
+sibling video output from replaying it (Step 5).
 
 - [ ] **Step 4: Add the diagnostic counter**
 
@@ -638,7 +639,7 @@ Step 7's negative-path test reads it, so it lands here rather than later. In
 
 - [ ] **Step 5: Inject in `Sink::Emit`**
 
-Replace `Sink::Emit` with a version that mirrors first, through the identical per-edge path. Factor the existing loop body into a lambda so the two packets cannot drift:
+Replace `Sink::Emit` with a version that mirrors first, through the identical per-edge path — the `PushOnRoutes` helper of Step 6 is what both packets share, so the two cannot drift. Note the `video_port` gate: only a keyframe emitted on a port that actually carries a video route may consume a candidate.
 
 ```cpp
   Status Emit(std::string_view port, Packet packet) override {
