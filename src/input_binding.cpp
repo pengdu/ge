@@ -167,7 +167,10 @@ PacketRef InputBinding::SkimHead(InputPortBinding& b, InputBatch* out) {
       continue;
     }
     if (head->is_event()) {
-      if (PacketRef ev = Take(b)) out->events.push_back(std::move(ev));
+      if (PacketRef ev = Take(b)) {
+        out->events.push_back(std::move(ev));
+        out->event_ports.push_back(b.port);
+      }
       continue;
     }
     if (!predecessor && IsEos(b.port)) {

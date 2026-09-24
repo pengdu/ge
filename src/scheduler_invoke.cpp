@@ -73,13 +73,19 @@ void Scheduler::InvokeBody(NodeRuntime& node, const std::shared_ptr<const Runtim
 
 namespace {
 
-// Moves an acquired batch into a request: events first, then data, with a
-// parallel port list (12 §4.5; on_event arrives with P7).
+// Moves an acquired batch into a request: control packets first (each with
+// its true source port, so a downstream can attribute a format event to one
+// of several inputs), then data, with a parallel port list (12 §4.5).
 template <typename Ports>
 void MoveBatchInto(InputBatch& batch, Ports& ports, std::vector<PacketRef>& inputs) {
-  for (PacketRef& ev : batch.events) {
-    ports.emplace_back();
-    inputs.push_back(std::move(ev));
+  for (std::size_t i = 0; i < batch.events.size(); ++i) {
+    // Bind the name to a local first: `ports` is a string_view list at one
+    // call site, and a ternary temporary would convert to a string_view of an
+    // expiring object (-Wdangling-capture).
+    const std::string name =
+        i < batch.event_ports.size() ? batch.event_ports[i] : std::string{};
+    ports.push_back(name);
+    inputs.push_back(std::move(batch.events[i]));
   }
   for (std::size_t i = 0; i < batch.packets.size(); ++i) {
     ports.emplace_back(batch.ports[i]);

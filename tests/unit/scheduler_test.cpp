@@ -553,4 +553,25 @@ TEST(SchedulerTest, TenNodeLatencyAndSchedulingOverhead) {
 #endif
 }
 
+TEST(SchedulerTest, EventPacketsReachCollectorWithTheirSourcePort) {
+  Fixture f;
+  ge::GraphBuilder b("event-ports");
+  auto src = b.AddNode(Op("Src@1.0.0"), "src",
+                       ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(std::int64_t{3})}}));
+  auto sink = b.AddNode(Op("Sink@1.0.0"), "sink");
+  b.Connect(src.port("out"), sink.port("in"), {.id = "e0"});
+  auto topo = f.Build(*b.Build());
+  ASSERT_TRUE(topo);
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec);
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  const std::vector<std::string> ports = f.sinks[0]->Ports();
+  const std::vector<ge::PacketSeq> seqs = f.sinks[0]->Seqs();
+  ASSERT_EQ(ports.size(), seqs.size());
+  for (const std::string& p : ports) EXPECT_EQ(p, "in");
+}
+
 }  // namespace

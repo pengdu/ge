@@ -145,6 +145,23 @@ TEST(InputBindingTest, EventPacketsBypassSync) {
   ASSERT_TRUE(batch.has_value());
   EXPECT_EQ(batch->events.size(), 1U);
   EXPECT_EQ(batch->packets.size(), 1U);
+  ASSERT_EQ(batch->event_ports.size(), batch->events.size());
+  EXPECT_EQ(batch->event_ports[0], "video");
+}
+
+TEST(InputBindingTest, EventPacketCarriesItsSourcePort) {
+  auto v = Edge("video");
+  auto a = Edge("audio");
+  ge::InputBinding in({{"video", v, true, {}}, {"audio", a, false, {}}}, ge::SyncPolicy::kAny);
+  ASSERT_EQ(v->Push(Data(1, 0, GE_PACKET_FLAG_EVENT)), ge::PushOutcome::kAccepted);
+  ASSERT_EQ(a->Push(Data(2, 0, GE_PACKET_FLAG_EVENT)), ge::PushOutcome::kAccepted);
+  auto batch = in.TryAcquire();
+  ASSERT_TRUE(batch.has_value());
+  ASSERT_EQ(batch->events.size(), 2U);
+  ASSERT_EQ(batch->event_ports.size(), 2U);
+  // SkimHead walks ports_ in declaration order, so video precedes audio.
+  EXPECT_EQ(batch->event_ports[0], "video");
+  EXPECT_EQ(batch->event_ports[1], "audio");
 }
 
 }  // namespace

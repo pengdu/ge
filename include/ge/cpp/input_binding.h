@@ -26,8 +26,13 @@ struct InputPortBinding {
 struct InputBatch {
   std::vector<std::string> ports;
   std::vector<PacketRef> packets;  // parallel to |ports|
-  // Packets that skipped synchronisation and go straight to on_event
+  // Packets that skipped synchronisation and go straight to the request's
+  // input list: control (EOS/events) never participates in alignment.
   std::vector<PacketRef> events;
+  // Source port of each entry in |events| (parallel vector). Downstreams
+  // need this to attribute a format event to one of several video inputs;
+  // a blank name here would make a two-video-input consumer blind.
+  std::vector<std::string> event_ports;
 };
 
 struct AlignedOptions {
