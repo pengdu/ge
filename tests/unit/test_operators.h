@@ -355,6 +355,17 @@ std::unique_ptr<Operator> Keep(std::vector<std::shared_ptr<Operator>>& keep, std
 // Emits |count| VideoFrame packets on "out" and |count| opaque Bytes packets
 // on "bytes", then reports exhausted. Both ports carry the same seq so a
 // consumer can pair them; "out" is the video path IsVideoRoute() must see.
+//
+// Backpressure shape: one shared cursor plus a per-port done flag for the
+// current seq. A port that already delivered the current seq is skipped on
+// retries; a blocked port re-attempts the same seq (never yet delivered, so
+// no duplicate) on the next call. The cursor only advances when every port
+// has delivered, keeping the two ports in lockstep and each port's emitted
+// seqs strictly increasing with no duplicates -- a re-emitted seq would
+// otherwise look like two different keyframes to the in-band format-event
+// mirror. Chosen over buffering pending Packets because the packet is
+// deterministic from the cursor, so rebuilding it on retry is free and the
+// state cannot disagree with itself.
 class VideoCountSource final : public Operator {
  public:
   explicit VideoCountSource(std::int64_t count) : count_(count) {}
@@ -362,31 +373,53 @@ class VideoCountSource final : public Operator {
   Result<ProcessResult> Process(const ProcessRequest& req) override {
     if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
     if (next_ >= count_) return ProcessResult::kExhausted;
-    const PacketSeq seq = static_cast<PacketSeq>(next_ + 1);
-    Packet v;
-    v.header.seq = seq;
-    v.header.pts_ns = next_ + 1;
-    v.header.flags = GE_PACKET_FLAG_KEYFRAME;
-    v.header.type_tag = TypeTagRegistry::Global().Intern("VideoFrame");
-    const Status vs = req.sink->Emit("out", std::move(v));
-    if (!vs.ok() && vs.code() != GE_STATUS_WOULD_BLOCK) return vs;
-    Packet b;
-    b.header.seq = seq;
-    b.header.pts_ns = next_ + 1;
-    b.header.type_tag = TypeTagRegistry::Global().Intern("Bytes");
-    const Status bs = req.sink->Emit("bytes", std::move(b));
-    if (!bs.ok() && bs.code() != GE_STATUS_WOULD_BLOCK) return bs;
-    if (vs.code() == GE_STATUS_WOULD_BLOCK || bs.code() == GE_STATUS_WOULD_BLOCK) {
-      return ProcessResult::kContinue;  // retry this seq later
+    // Try every port that has not delivered the current seq yet. A blocking
+    // port simply stays undelivered for the next call; it must not stop the
+    // others from making progress.
+    if (!out_done_) {
+      const Status s = req.sink->Emit("out", MakePacket(GE_PACKET_FLAG_KEYFRAME, "VideoFrame"));
+      if (s.code() == GE_STATUS_WOULD_BLOCK) {
+        // leave out_done_ false: retry this same (never-delivered) seq later
+      } else if (!s.ok()) {
+        return s;
+      } else {
+        out_done_ = true;
+      }
     }
-    ++next_;
+    if (!bytes_done_) {
+      const Status s = req.sink->Emit("bytes", MakePacket(0, "Bytes"));
+      if (s.code() == GE_STATUS_WOULD_BLOCK) {
+        // leave bytes_done_ false: retry this same seq later
+      } else if (!s.ok()) {
+        return s;
+      } else {
+        bytes_done_ = true;
+      }
+    }
+    // The cursor only steps once every port has delivered the current seq.
+    if (out_done_ && bytes_done_) {
+      ++next_;
+      out_done_ = false;
+      bytes_done_ = false;
+    }
     return ProcessResult::kContinue;
   }
   Status Close(const CloseRequest&) override { return Status::Ok(); }
 
  private:
+  Packet MakePacket(std::uint32_t flags, const char* tag) const {
+    Packet p;
+    p.header.seq = static_cast<PacketSeq>(next_ + 1);
+    p.header.pts_ns = next_ + 1;
+    p.header.flags = flags;
+    p.header.type_tag = TypeTagRegistry::Global().Intern(tag);
+    return p;
+  }
+
   std::int64_t count_;
   std::int64_t next_ = 0;
+  bool out_done_ = false;
+  bool bytes_done_ = false;
 };
 
 // A video source with one video output ("out", NV12+P010, multi) and one

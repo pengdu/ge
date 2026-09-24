@@ -228,10 +228,28 @@ TEST(FormatEventTest, MatchSeqRejectsEverythingButAPositiveInteger) {
       {"first_key_seq", ge::JsonValue(std::int64_t{-4})}})).has_value());
   // A non-object detail has no keys at all.
   EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(std::int64_t{7})).has_value());
+  // A fractional number is not an integer key: 4.9 must not bind as seq 4.
+  EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{
+      {"first_key_seq", ge::JsonValue(4.9)}})).has_value());
+  // A value far outside int64 range must be rejected by the type check, not
+  // by a cast (which would be undefined behaviour).
+  EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{
+      {"first_key_seq", ge::JsonValue(1e300)}})).has_value());
   const auto ok = FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{
       {"first_key_seq", ge::JsonValue(std::int64_t{42})}}));
   ASSERT_TRUE(ok.has_value());
   EXPECT_EQ(*ok, 42U);
+}
+
+// An integer *token* parses as kInteger (src/json.cpp:114), so a detail that
+// round-trips through the JSON parser still binds the same way.
+TEST(FormatEventTest, MatchSeqSurvivesAJsonRoundTrip) {
+  const ge::JsonParseResult parsed =
+      ge::ParseJson("{\"first_key_seq\": 42, \"pixel_format\": \"NV12\"}");
+  ASSERT_TRUE(parsed.value.has_value());
+  const auto seq = ge::FormatEventMatchSeq(*parsed.value);
+  ASSERT_TRUE(seq.has_value());
+  EXPECT_EQ(*seq, 42U);
 }
 
 TEST(FormatEventTest, EventPacketCopiesTheKeyframeIdentity) {
@@ -243,9 +261,11 @@ TEST(FormatEventTest, EventPacketCopiesTheKeyframeIdentity) {
   key.header.type_tag = ge::TypeTagRegistry::Global().Intern("VideoFrame");
   const ge::JsonValue detail(ge::JsonObject{{"first_key_seq", ge::JsonValue(std::int64_t{9})},
                                             {"pixel_format", ge::JsonValue("NV12")}});
-  const ge::Packet ev = ge::MakeFormatEventPacket(key, "media_format_changed", detail);
+  const ge::Packet ev = ge::MakeFormatEventPacket(key, ge::kFormatEventType, detail);
   EXPECT_TRUE(ev.is_event());
   EXPECT_FALSE(ev.is_eos());
+  // Exactly the event flag: no keyframe bit, nothing else either.
+  EXPECT_EQ(ev.header.flags, GE_PACKET_FLAG_EVENT);
   EXPECT_FALSE((ev.header.flags & GE_PACKET_FLAG_KEYFRAME) != 0);
   EXPECT_EQ(ev.header.seq, 9U);
   EXPECT_EQ(ev.header.pts_ns, 1234);
@@ -257,6 +277,19 @@ TEST(FormatEventTest, EventPacketCopiesTheKeyframeIdentity) {
   const std::string* seq = ev.metadata->Get("first_key_seq");
   ASSERT_NE(seq, nullptr);
   EXPECT_EQ(*seq, "9");
+}
+
+// The builder tags the packet with the event name it was handed. Choosing
+// which events get mirrored is the caller's rule, so the builder must not
+// quietly substitute kFormatEventType for a different requested type.
+TEST(FormatEventTest, EventPacketUsesTheRequestedEventType) {
+  ge::Packet key;
+  key.header.seq = 3;
+  key.header.type_tag = ge::TypeTagRegistry::Global().Intern("VideoFrame");
+  const ge::JsonValue detail(ge::JsonObject{{"first_key_seq", ge::JsonValue(std::int64_t{3})}});
+  const ge::Packet ev = ge::MakeFormatEventPacket(key, "some_other_event", detail);
+  EXPECT_EQ(ev.header.type_tag, ge::TypeTagRegistry::Global().Intern("some_other_event"));
+  EXPECT_NE(ev.header.type_tag, ge::TypeTagRegistry::Global().Intern(ge::kFormatEventType));
 }
 
 }  // namespace

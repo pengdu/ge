@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -594,6 +595,64 @@ TEST(SchedulerTest, OnlyVideoContractsCountAsVideoRoutes) {
   ASSERT_NE(bytes, nullptr);
   ASSERT_FALSE(bytes->empty());
   EXPECT_FALSE(ge::IsVideoRoute(bytes->front().contract));
+}
+
+// A sink that records what each port received and can refuse "out" until told
+// otherwise, so one Process call sees one port blocked and the other free.
+class RecordingBlockSink final : public ge::EmitSink {
+ public:
+  ge::Status Emit(std::string_view port, ge::Packet packet) override {
+    if (port == "out" && block_out) return ge::Status::WouldBlock();
+    seqs[std::string(port)].push_back(packet.header.seq);
+    return ge::Status::Ok();
+  }
+  bool block_out = false;
+  std::map<std::string, std::vector<ge::PacketSeq>> seqs;
+};
+
+// Regression: the shared video-source helper used to re-emit a seq on the
+// port that had already accepted it, whenever the *other* port blocked. A
+// re-emitted seq is exactly what a duplicate-publication check would misread
+// as a second keyframe, so each port's emitted seqs must be strictly
+// increasing with no duplicates.
+TEST(SchedulerTest, VideoSourceNeverReemitsASeqUnderPartialBackpressure) {
+  VideoCountSource src(3);
+  RecordingBlockSink sink;
+  ge::ProcessRequest req;
+  req.sink = &sink;
+
+  // Both ports accept: seq 1 goes out on each.
+  ASSERT_TRUE(src.Process(req).ok());
+  EXPECT_EQ(sink.seqs["out"], (std::vector<ge::PacketSeq>{1}));
+  EXPECT_EQ(sink.seqs["bytes"], (std::vector<ge::PacketSeq>{1}));
+
+  // "out" blocks: the seq that port already delivered must not repeat, while
+  // "bytes" is free to advance to seq 2.
+  sink.block_out = true;
+  ASSERT_TRUE(src.Process(req).ok());
+  EXPECT_EQ(sink.seqs["out"], (std::vector<ge::PacketSeq>{1}));
+  EXPECT_EQ(sink.seqs["bytes"], (std::vector<ge::PacketSeq>{1, 2}));
+
+  // Unblocked: "out" delivers the seq it was holding (2), not a repeat of 1.
+  sink.block_out = false;
+  ASSERT_TRUE(src.Process(req).ok());
+  EXPECT_EQ(sink.seqs["out"], (std::vector<ge::PacketSeq>{1, 2}));
+
+  // Drain, then the source is exhausted with both ports having seen 1..3.
+  bool exhausted = false;
+  for (int i = 0; i < 10 && !exhausted; ++i) {
+    const auto r = src.Process(req);
+    ASSERT_TRUE(r.ok()) << r.status().ToString();
+    exhausted = (*r == ge::ProcessResult::kExhausted);
+  }
+  EXPECT_TRUE(exhausted);
+  EXPECT_EQ(sink.seqs["out"], (std::vector<ge::PacketSeq>{1, 2, 3}));
+  EXPECT_EQ(sink.seqs["bytes"], (std::vector<ge::PacketSeq>{1, 2, 3}));
+
+  for (const auto& [port, s] : sink.seqs) {
+    EXPECT_TRUE(std::is_sorted(s.begin(), s.end())) << port;
+    EXPECT_EQ(std::adjacent_find(s.begin(), s.end()), s.end()) << port;
+  }
 }
 
 }  // namespace
