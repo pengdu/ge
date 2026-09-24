@@ -123,6 +123,9 @@ struct NodeMetrics {
   std::atomic<std::uint64_t> reorder_gaps{0};
   std::atomic<std::uint64_t> late_completions{0};
   std::atomic<std::uint64_t> orphan_completions{0};
+  // EVT-4: staged format events that never found their binding keyframe.
+  // Side-band publication is unaffected; this is the diagnostic count.
+  std::atomic<std::uint64_t> format_events_unmirrored{0};
   // Ingress timestamp (Packet::ingress_ns) of the oldest input of the
   // invocation currently running on this node; outputs emitted during the
   // call inherit it. One invocation at a time per node for sync operators

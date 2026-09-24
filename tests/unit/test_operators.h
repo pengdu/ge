@@ -422,6 +422,108 @@ class VideoCountSource final : public Operator {
   bool bytes_done_ = false;
 };
 
+// Publishes "media_format_changed" and then emits one packet in the same
+// Process call, so the scheduler sees the publication and the emit that may
+// bind to it within a single invocation.
+//
+// |detail_seq| is the seq the detail names as its keyframe; it is a separate
+// parameter from |key_seq_| on purpose, so a test can publish a binding that
+// does not match what the node emits. |keyframe| controls the emitted
+// packet's GE_PACKET_FLAG_KEYFRAME: with it false, a packet whose seq matches
+// |detail_seq| still must not consume the candidate, because the binding is
+// keyframe-specific, not seq-specific.
+class FormatAnnouncer final : public Operator {
+ public:
+  explicit FormatAnnouncer(PacketSeq key_seq, PacketSeq detail_seq, bool keyframe = true)
+      : key_seq_(key_seq), detail_seq_(detail_seq), keyframe_(keyframe) {}
+  Status Open(const OpenRequest&) override { return Status::Ok(); }
+  Result<ProcessResult> Process(const ProcessRequest& req) override {
+    if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
+    if (done_) return ProcessResult::kExhausted;
+    done_ = true;
+    if (req.events != nullptr) {
+      JsonObject d;
+      d.emplace("first_key_seq", JsonValue(static_cast<std::uint64_t>(detail_seq_)));
+      d.emplace("pixel_format", JsonValue("NV12"));
+      req.events->Publish("media_format_changed", Severity::kInfo, JsonValue(std::move(d)));
+    }
+    Packet p;
+    p.header.seq = key_seq_;
+    p.header.pts_ns = 1000;
+    p.header.flags = keyframe_ ? GE_PACKET_FLAG_KEYFRAME : 0u;
+    p.header.type_tag = TypeTagRegistry::Global().Intern("VideoFrame");
+    return req.sink->Emit("out", std::move(p));
+  }
+  Status Close(const CloseRequest&) override { return Status::Ok(); }
+
+ private:
+  PacketSeq key_seq_;
+  PacketSeq detail_seq_;
+  bool keyframe_;
+  bool done_ = false;
+};
+
+// Records events and data separately, in arrival order, with the port each
+// arrived on. Unlike Collector it keeps event packets in the same list, so a
+// test can assert the event/record relative order that the in-band mirror
+// promises.
+class EventAwareCollector final : public Operator {
+ public:
+  struct Entry {
+    PacketSeq seq;
+    bool event;
+    std::string port;
+    TopologyVersion topology_version;
+    ParameterVersion parameter_version;
+  };
+  Status Open(const OpenRequest&) override { return Status::Ok(); }
+  Result<ProcessResult> Process(const ProcessRequest& req) override {
+    if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
+    std::lock_guard lock(mutex_);
+    for (std::size_t i = 0; i < req.inputs.size(); ++i) {
+      entries.push_back({req.inputs[i]->header.seq, req.inputs[i]->is_event(),
+                         std::string(req.input_ports[i]),
+                         req.inputs[i]->header.topology_version,
+                         req.inputs[i]->header.parameter_version});
+    }
+    return ProcessResult::kContinue;
+  }
+  Status Close(const CloseRequest&) override { return Status::Ok(); }
+  std::vector<Entry> Entries() const {
+    std::lock_guard lock(mutex_);
+    return entries;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<Entry> entries;
+};
+
+// Registers the in-band format-event pair: "Announce@1.0.0" (a video source
+// that publishes "media_format_changed" bound to |detail_seq| and then emits
+// its keyframe on "out") and "Collect@1.0.0" (an EventAwareCollector on "in").
+// |key_seq| is what the node actually emits, so the two differ whenever a
+// test wants a publication that cannot bind.
+inline void RegisterFormatAnnouncerFixture(BuiltinOperatorFactory& factory,
+                                           std::vector<std::shared_ptr<Operator>>& keep,
+                                           PacketSeq key_seq, PacketSeq detail_seq,
+                                           EventAwareCollector** collector,
+                                           bool keyframe = true) {
+  factory.Register(Desc("Announce@1.0.0", {},
+                        {VideoPort("out", PortDirection::kOutput, {"NV12"},
+                                   PortCardinality::kMulti)},
+                        true, 1),
+                   [&keep, key_seq, detail_seq, keyframe](const OperatorCreateArgs&) {
+                     return Keep(keep, std::make_shared<FormatAnnouncer>(key_seq, detail_seq, keyframe));
+                   });
+  factory.Register(Desc("Collect@1.0.0", {VideoPort("in", PortDirection::kInput, {"NV12"})}, {}),
+                   [&keep, collector](const OperatorCreateArgs&) {
+                     auto c = std::make_shared<EventAwareCollector>();
+                     *collector = c.get();
+                     return Keep(keep, std::move(c));
+                   });
+}
+
 // A video source with one video output ("out", NV12+P010, multi) and one
 // opaque output ("bytes", a plain Bytes port, so IsVideoRoute() is false for
 // it), plus a video sink ("in", NV12). Shared by the tests that need a graph

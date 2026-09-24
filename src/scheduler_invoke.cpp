@@ -76,19 +76,21 @@ namespace {
 // Moves an acquired batch into a request: control packets first (each with
 // its true source port, so a downstream can attribute a format event to one
 // of several inputs), then data, with a parallel port list (12 §4.5).
-template <typename Ports>
-void MoveBatchInto(InputBatch& batch, Ports& ports, std::vector<PacketRef>& inputs) {
+//
+// |names| is the owning store for the port names. The names are pushed there
+// first and the views are derived afterwards, because a view onto a local (or
+// onto |names| before its final size is known) is invalidated by
+// reallocation -- an event port read from a dead frame is exactly the bug this
+// shape prevents.
+void MoveBatchInto(InputBatch& batch, std::vector<std::string>& names,
+                   std::vector<PacketRef>& inputs) {
+  names.reserve(batch.events.size() + batch.packets.size());
   for (std::size_t i = 0; i < batch.events.size(); ++i) {
-    // Bind the name to a local first: `ports` is a string_view list at one
-    // call site, and a ternary temporary would convert to a string_view of an
-    // expiring object (-Wdangling-capture).
-    const std::string name =
-        i < batch.event_ports.size() ? batch.event_ports[i] : std::string{};
-    ports.push_back(name);
+    names.emplace_back(i < batch.event_ports.size() ? batch.event_ports[i] : std::string{});
     inputs.push_back(std::move(batch.events[i]));
   }
   for (std::size_t i = 0; i < batch.packets.size(); ++i) {
-    ports.emplace_back(batch.ports[i]);
+    names.emplace_back(batch.ports[i]);
     inputs.push_back(std::move(batch.packets[i]));
   }
 }
@@ -225,7 +227,9 @@ void Scheduler::RunProcess(NodeRuntime& node, const RuntimeTopology& topo, Input
   req.parameters = &params->values;
   req.sink = &sink;
   req.events = &sink;
-  MoveBatchInto(*batch, req.input_ports, req.inputs);
+  MoveBatchInto(*batch, req.input_port_names, req.inputs);
+  req.input_ports.reserve(req.input_port_names.size());
+  for (const std::string& name : req.input_port_names) req.input_ports.emplace_back(name);
   node.metrics().packets_in.fetch_add(req.inputs.size(), std::memory_order_relaxed);
   NoteIngress(node, req.inputs);
   if (!RunProcessCall(node, req, sink)) return;
@@ -280,6 +284,9 @@ void Scheduler::RunAsync(NodeRuntime& node, const std::shared_ptr<const RuntimeT
   req.topology = topo;
   req.parameters = params;
   req.packet_seq = first_seq;
+  // AsyncDispatch::Request owns its port names as strings; the async runtime
+  // re-materializes views from them when it builds each SubmitRequest, so the
+  // names must stay alive (they are moved into the queued job).
   MoveBatchInto(*batch, req.input_ports, req.inputs);
   node.metrics().packets_in.fetch_add(req.inputs.size(), std::memory_order_relaxed);
   NoteIngress(node, req.inputs);

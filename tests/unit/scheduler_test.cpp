@@ -118,6 +118,32 @@ struct Fixture {
 
 ge::OperatorKey Op(const char* t) { return *ge::OperatorKey::Parse(t); }
 
+// Records the side-band publications the engine forwards through
+// SchedulerEvents::on_operator_event, and hands the scheduler a std::function
+// that appends to it. The hook fires on an executor thread, so the list is
+// mutex-guarded.
+class ObservedEvents final {
+ public:
+  struct Entry {
+    std::string node;
+    std::string type;
+  };
+  [[nodiscard]] std::function<void(ge::NodeRuntime&, std::string, ge::Severity, ge::JsonValue)> Hook() {
+    return [this](ge::NodeRuntime& node, std::string type, ge::Severity, ge::JsonValue) {
+      std::lock_guard lock(mutex_);
+      entries_.push_back({node.external_id(), std::move(type)});
+    };
+  }
+  std::vector<Entry> Entries() const {
+    std::lock_guard lock(mutex_);
+    return entries_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<Entry> entries_;
+};
+
 
 ge::GraphSpec Linear(int nodes, std::int64_t count, ge::DropPolicy policy = ge::DropPolicy::kBlock,
                      std::uint32_t capacity = 64, std::int64_t pass_delay_us = 0) {
@@ -653,6 +679,142 @@ TEST(SchedulerTest, VideoSourceNeverReemitsASeqUnderPartialBackpressure) {
     EXPECT_TRUE(std::is_sorted(s.begin(), s.end())) << port;
     EXPECT_EQ(std::adjacent_find(s.begin(), s.end()), s.end()) << port;
   }
+}
+
+// EVT-4: a "media_format_changed" publication whose detail names the keyframe
+// it belongs to reaches the consumer as an event Packet placed immediately
+// before that keyframe, on the same edge and in one Process call.
+TEST(SchedulerTest, FormatEventArrivesBeforeItsKeyframe) {
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  EventAwareCollector* sink = nullptr;
+  RegisterFormatAnnouncerFixture(factory, keep, /*key_seq=*/7, /*detail_seq=*/7, &sink);
+  ge::GraphBuilder b("format-frontier");
+  auto src = b.AddNode(Op("Announce@1.0.0"), "announce");
+  auto col = b.AddNode(Op("Collect@1.0.0"), "collect");
+  b.Connect(src.port("out"), col.port("in"), {.id = "e0"});
+  auto r = ge::RuntimeTopology::Build(*b.Build(), factory, {.session_id = 11, .version = 1});
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  auto topo = *r;
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec);
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  ASSERT_NE(sink, nullptr);
+  const std::vector<EventAwareCollector::Entry> got = sink->Entries();
+  ASSERT_EQ(got.size(), 2U) << "expected the event Packet and then the keyframe";
+  EXPECT_TRUE(got[0].event);
+  EXPECT_EQ(got[0].seq, 7U);
+  EXPECT_EQ(got[0].port, "in");
+  EXPECT_FALSE(got[1].event);
+  EXPECT_EQ(got[1].seq, 7U);
+  EXPECT_EQ(got[1].port, "in");
+  // The binding was consumed, so nothing was left dangling at call end.
+  EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 0U);
+}
+
+// EVT-4: when the publication names a keyframe the node never emits, the
+// event stays side-band only. The binding is a promise about a specific
+// keyframe, not a claim that "some packet" carried it.
+TEST(SchedulerTest, UnboundFormatEventStaysSideBandOnly) {
+  ObservedEvents observed;
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  EventAwareCollector* sink = nullptr;
+  // Detail binds seq 7; the node emits seq 8.
+  RegisterFormatAnnouncerFixture(factory, keep, /*key_seq=*/8, /*detail_seq=*/7, &sink);
+  ge::GraphBuilder b("format-unbound");
+  auto src = b.AddNode(Op("Announce@1.0.0"), "announce");
+  auto col = b.AddNode(Op("Collect@1.0.0"), "collect");
+  b.Connect(src.port("out"), col.port("in"), {.id = "e0"});
+  auto r = ge::RuntimeTopology::Build(*b.Build(), factory, {.session_id = 11, .version = 1});
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  auto topo = *r;
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec, ge::SchedulerEvents{.on_operator_event = observed.Hook()});
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  ASSERT_NE(sink, nullptr);
+  const std::vector<EventAwareCollector::Entry> got = sink->Entries();
+  ASSERT_EQ(got.size(), 1U) << "the keyframe only: nothing binds to it";
+  EXPECT_FALSE(got[0].event);
+  EXPECT_EQ(got[0].seq, 8U);
+  // The side-band copy is unaffected by the missing binding.
+  const std::vector<ObservedEvents::Entry> side = observed.Entries();
+  ASSERT_EQ(side.size(), 1U);
+  EXPECT_EQ(side[0].type, "media_format_changed");
+  // The candidate never found its keyframe, so the call-end counter advanced.
+  EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 1U);
+}
+
+// EVT-4: the binding is keyframe-specific, not seq-specific. A data packet
+// carrying the bound seq must not consume the candidate, or a downstream
+// would see a format change attached to a frame that is not a keyframe.
+TEST(SchedulerTest, NonKeyframeSeqDoesNotConsumeCandidate) {
+  ObservedEvents observed;
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  EventAwareCollector* sink = nullptr;
+  // Same seq as the detail, but emitted without GE_PACKET_FLAG_KEYFRAME.
+  RegisterFormatAnnouncerFixture(factory, keep, /*key_seq=*/7, /*detail_seq=*/7, &sink,
+                                 /*keyframe=*/false);
+  ge::GraphBuilder b("format-non-keyframe");
+  auto src = b.AddNode(Op("Announce@1.0.0"), "announce");
+  auto col = b.AddNode(Op("Collect@1.0.0"), "collect");
+  b.Connect(src.port("out"), col.port("in"), {.id = "e0"});
+  auto r = ge::RuntimeTopology::Build(*b.Build(), factory, {.session_id = 11, .version = 1});
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  auto topo = *r;
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec, ge::SchedulerEvents{.on_operator_event = observed.Hook()});
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  ASSERT_NE(sink, nullptr);
+  const std::vector<EventAwareCollector::Entry> got = sink->Entries();
+  ASSERT_EQ(got.size(), 1U) << "the non-keyframe packet only";
+  EXPECT_FALSE(got[0].event);
+  EXPECT_EQ(got[0].seq, 7U);
+  ASSERT_EQ(observed.Entries().size(), 1U);
+  EXPECT_EQ(observed.Entries()[0].type, "media_format_changed");
+  // A seq-7 packet existed, and the candidate still went unmatched.
+  EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 1U);
+}
+
+// EVT-4: mirroring must not be the price of the side-band contract. With no
+// subscriber the observation hook is absent, and the in-band half still has
+// to work -- the binding is only about who receives a mirror, not about
+// whether the publication happened.
+TEST(SchedulerTest, FormatEventMirrorsWithoutASideBandSubscriber) {
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  EventAwareCollector* sink = nullptr;
+  RegisterFormatAnnouncerFixture(factory, keep, /*key_seq=*/7, /*detail_seq=*/7, &sink);
+  ge::GraphBuilder b("format-no-subscriber");
+  auto src = b.AddNode(Op("Announce@1.0.0"), "announce");
+  auto col = b.AddNode(Op("Collect@1.0.0"), "collect");
+  b.Connect(src.port("out"), col.port("in"), {.id = "e0"});
+  auto r = ge::RuntimeTopology::Build(*b.Build(), factory, {.session_id = 11, .version = 1});
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  auto topo = *r;
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec);  // no on_operator_event
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  ASSERT_NE(sink, nullptr);
+  const std::vector<EventAwareCollector::Entry> got = sink->Entries();
+  ASSERT_EQ(got.size(), 2U) << "the in-band mirror does not depend on the hook";
+  EXPECT_TRUE(got[0].event);
+  EXPECT_EQ(got[0].seq, 7U);
+  EXPECT_FALSE(got[1].event);
+  EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 0U);
 }
 
 }  // namespace

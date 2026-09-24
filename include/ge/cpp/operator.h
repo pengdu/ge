@@ -72,6 +72,12 @@ struct ProcessRequest {
   ParameterVersion parameter_version = 0;
   std::uint32_t flags = 0;  // GE_PROCESS_FLAG_*
   std::vector<std::string_view> input_ports;
+  // Owner of the strings |input_ports| points at. The list operators read is
+  // a view list, but a name must outlive the call: a caller that names a port
+  // with a temporary would otherwise leave |input_ports| dangling. Fill this
+  // first and build the views from it (iterators/views into a vector die on
+  // reallocation, so nothing may append after the views are taken).
+  std::vector<std::string> input_port_names;
   std::vector<PacketRef> inputs;  // parallel to input_ports
   const JsonValue* parameters = nullptr;
   EmitSink* sink = nullptr;
