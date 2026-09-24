@@ -5,6 +5,7 @@
 // (scheduler.cpp, scheduler_invoke.cpp, scheduler_backpressure.cpp,
 // scheduler_retire.cpp). State machine: docs/16-调度器状态机.md.
 
+#include <ge/cpp/input_binding.h>
 #include <ge/cpp/scheduler.h>
 
 namespace ge {

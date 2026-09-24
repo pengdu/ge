@@ -63,6 +63,19 @@ inline PortCapability BytesPort(const char* name, PortDirection dir, bool requir
   return p;
 }
 
+// A video port: carries VideoConstraints, which is what IsVideoRoute() reads.
+inline PortCapability VideoPort(const char* name, PortDirection dir, std::vector<std::string> pf,
+                                PortCardinality card = PortCardinality::kSingle) {
+  PortCapability p;
+  p.name = name;
+  p.direction = dir;
+  p.type_tag = "VideoFrame";
+  p.cardinality = card;
+  p.video = VideoConstraints{};
+  p.video->pixel_formats = std::move(pf);
+  return p;
+}
+
 inline CapabilityDescriptor Desc(const char* key, std::vector<PortCapability> ins,
                                  std::vector<PortCapability> outs, bool stateful = false,
                                  std::uint32_t max_par = 4) {
@@ -337,6 +350,66 @@ template <typename T>
 std::unique_ptr<Operator> Keep(std::vector<std::shared_ptr<Operator>>& keep, std::shared_ptr<T> impl) {
   keep.push_back(impl);
   return std::make_unique<Shared<T>>(std::move(impl));
+}
+
+// Emits |count| VideoFrame packets on "out" and |count| opaque Bytes packets
+// on "bytes", then reports exhausted. Both ports carry the same seq so a
+// consumer can pair them; "out" is the video path IsVideoRoute() must see.
+class VideoCountSource final : public Operator {
+ public:
+  explicit VideoCountSource(std::int64_t count) : count_(count) {}
+  Status Open(const OpenRequest&) override { return Status::Ok(); }
+  Result<ProcessResult> Process(const ProcessRequest& req) override {
+    if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
+    if (next_ >= count_) return ProcessResult::kExhausted;
+    const PacketSeq seq = static_cast<PacketSeq>(next_ + 1);
+    Packet v;
+    v.header.seq = seq;
+    v.header.pts_ns = next_ + 1;
+    v.header.flags = GE_PACKET_FLAG_KEYFRAME;
+    v.header.type_tag = TypeTagRegistry::Global().Intern("VideoFrame");
+    const Status vs = req.sink->Emit("out", std::move(v));
+    if (!vs.ok() && vs.code() != GE_STATUS_WOULD_BLOCK) return vs;
+    Packet b;
+    b.header.seq = seq;
+    b.header.pts_ns = next_ + 1;
+    b.header.type_tag = TypeTagRegistry::Global().Intern("Bytes");
+    const Status bs = req.sink->Emit("bytes", std::move(b));
+    if (!bs.ok() && bs.code() != GE_STATUS_WOULD_BLOCK) return bs;
+    if (vs.code() == GE_STATUS_WOULD_BLOCK || bs.code() == GE_STATUS_WOULD_BLOCK) {
+      return ProcessResult::kContinue;  // retry this seq later
+    }
+    ++next_;
+    return ProcessResult::kContinue;
+  }
+  Status Close(const CloseRequest&) override { return Status::Ok(); }
+
+ private:
+  std::int64_t count_;
+  std::int64_t next_ = 0;
+};
+
+// A video source with one video output ("out", NV12+P010, multi) and one
+// opaque output ("bytes", a plain Bytes port, so IsVideoRoute() is false for
+// it), plus a video sink ("in", NV12). Shared by the tests that need a graph
+// where exactly one edge is a video route; Task 4 reuses it rather than
+// registering a second copy.
+inline void RegisterVideoFixture(BuiltinOperatorFactory& factory,
+                                 std::vector<std::shared_ptr<Operator>>& keep) {
+  factory.Register(Desc("VSrc@1.0.0", {},
+                        {VideoPort("out", PortDirection::kOutput, {"NV12", "P010"},
+                                   PortCardinality::kMulti),
+                         BytesPort("bytes", PortDirection::kOutput, false)},
+                        true, 1),
+                   [&keep](const OperatorCreateArgs& a) {
+                     auto s = std::make_shared<VideoCountSource>(a.options.GetInteger("count").value_or(1));
+                     return Keep(keep, std::move(s));
+                   });
+  factory.Register(Desc("VSink@1.0.0", {VideoPort("in", PortDirection::kInput, {"NV12"})}, {}),
+                   [&keep](const OperatorCreateArgs&) {
+                     auto c = std::make_shared<Collector>();
+                     return Keep(keep, std::move(c));
+                   });
 }
 
 }  // namespace ge::test

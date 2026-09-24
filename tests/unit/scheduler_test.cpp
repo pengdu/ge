@@ -105,6 +105,7 @@ struct Fixture {
                      [](const ge::OperatorCreateArgs& a) {
                        return std::make_unique<Burst>(static_cast<int>(a.options.GetInteger("factor").value_or(4)));
                      });
+    RegisterVideoFixture(factory, keep);
   }
 
   std::shared_ptr<ge::RuntimeTopology> Build(const ge::GraphSpec& spec) {
@@ -572,6 +573,27 @@ TEST(SchedulerTest, EventPacketsReachCollectorWithTheirSourcePort) {
   const std::vector<ge::PacketSeq> seqs = f.sinks[0]->Seqs();
   ASSERT_EQ(ports.size(), seqs.size());
   for (const std::string& p : ports) EXPECT_EQ(p, "in");
+}
+
+TEST(SchedulerTest, OnlyVideoContractsCountAsVideoRoutes) {
+  Fixture f;
+  ge::GraphBuilder b("video-route");
+  auto src = b.AddNode(Op("VSrc@1.0.0"), "src",
+                       ge::JsonValue(ge::JsonObject{{"count", ge::JsonValue(std::int64_t{1})}}));
+  auto vout = b.AddNode(Op("VSink@1.0.0"), "vout");
+  auto bout = b.AddNode(Op("Sink@1.0.0"), "bout");
+  b.Connect(src.port("out"), vout.port("in"), {.id = "e0"});
+  b.Connect(src.port("bytes"), bout.port("in"), {.id = "e1"});
+  auto topo = f.Build(*b.Build());
+  ASSERT_TRUE(topo);
+  const std::vector<ge::RouteEntry>* video = topo->RoutesFor(topo->FindNode("src")->id(), "out");
+  ASSERT_NE(video, nullptr);
+  ASSERT_FALSE(video->empty());
+  EXPECT_TRUE(ge::IsVideoRoute(video->front().contract));
+  const std::vector<ge::RouteEntry>* bytes = topo->RoutesFor(topo->FindNode("src")->id(), "bytes");
+  ASSERT_NE(bytes, nullptr);
+  ASSERT_FALSE(bytes->empty());
+  EXPECT_FALSE(ge::IsVideoRoute(bytes->front().contract));
 }
 
 }  // namespace

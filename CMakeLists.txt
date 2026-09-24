@@ -106,6 +106,7 @@ add_library (
   src/packet.cpp
   src/edge_channel.cpp
   src/input_binding.cpp
+  src/format_event.cpp
   src/node_runtime.cpp
   src/runtime_topology.cpp
   src/executor_pool.cpp

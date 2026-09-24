@@ -24,18 +24,6 @@ using namespace ge::test;
 
 ge::OperatorKey Op(const char* text) { return *ge::OperatorKey::Parse(text); }
 
-ge::PortCapability VideoPort(const char* name, ge::PortDirection dir, std::vector<std::string> pf,
-                             ge::PortCardinality card = ge::PortCardinality::kSingle) {
-  ge::PortCapability p;
-  p.name = name;
-  p.direction = dir;
-  p.type_tag = "VideoFrame";
-  p.cardinality = card;
-  p.video = ge::VideoConstraints{};
-  p.video->pixel_formats = std::move(pf);
-  return p;
-}
-
 // Records what Open saw and publishes one event per packet.
 class Probe final : public ge::Operator {
  public:

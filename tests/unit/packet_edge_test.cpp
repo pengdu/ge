@@ -1,4 +1,5 @@
 #include <ge/cpp/edge_channel.h>
+#include <ge/cpp/input_binding.h>
 #include <ge/cpp/packet.h>
 
 #include <gtest/gtest.h>
@@ -214,6 +215,48 @@ TEST(EdgeChannelTest, SpscUnderThreads) {
   }
   producer.join();
   EXPECT_EQ(e.metrics().Load().popped, static_cast<std::uint64_t>(kN));
+}
+
+TEST(FormatEventTest, MatchSeqRejectsEverythingButAPositiveInteger) {
+  using ge::FormatEventMatchSeq;
+  EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{})).has_value());
+  EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{
+      {"first_key_seq", ge::JsonValue("7")}})).has_value());
+  EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{
+      {"first_key_seq", ge::JsonValue(std::int64_t{0})}})).has_value());
+  EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{
+      {"first_key_seq", ge::JsonValue(std::int64_t{-4})}})).has_value());
+  // A non-object detail has no keys at all.
+  EXPECT_FALSE(FormatEventMatchSeq(ge::JsonValue(std::int64_t{7})).has_value());
+  const auto ok = FormatEventMatchSeq(ge::JsonValue(ge::JsonObject{
+      {"first_key_seq", ge::JsonValue(std::int64_t{42})}}));
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(*ok, 42U);
+}
+
+TEST(FormatEventTest, EventPacketCopiesTheKeyframeIdentity) {
+  ge::Packet key;
+  key.header.seq = 9;
+  key.header.pts_ns = 1234;
+  key.header.dts_ns = 1200;
+  key.header.flags = GE_PACKET_FLAG_KEYFRAME;
+  key.header.type_tag = ge::TypeTagRegistry::Global().Intern("VideoFrame");
+  const ge::JsonValue detail(ge::JsonObject{{"first_key_seq", ge::JsonValue(std::int64_t{9})},
+                                            {"pixel_format", ge::JsonValue("NV12")}});
+  const ge::Packet ev = ge::MakeFormatEventPacket(key, "media_format_changed", detail);
+  EXPECT_TRUE(ev.is_event());
+  EXPECT_FALSE(ev.is_eos());
+  EXPECT_FALSE((ev.header.flags & GE_PACKET_FLAG_KEYFRAME) != 0);
+  EXPECT_EQ(ev.header.seq, 9U);
+  EXPECT_EQ(ev.header.pts_ns, 1234);
+  EXPECT_EQ(ev.header.dts_ns, 1200);
+  EXPECT_EQ(ev.header.type_tag, ge::TypeTagRegistry::Global().Intern("media_format_changed"));
+  // Metadata entries are strings, so numbers round-trip through their JSON
+  // text; the structured detail travels in the side-band event.
+  ASSERT_TRUE(ev.metadata != nullptr);
+  const std::string* seq = ev.metadata->Get("first_key_seq");
+  ASSERT_NE(seq, nullptr);
+  EXPECT_EQ(*seq, "9");
 }
 
 }  // namespace

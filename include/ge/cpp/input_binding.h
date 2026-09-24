@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <ge/cpp/edge_channel.h>
@@ -34,6 +35,38 @@ struct InputBatch {
   // a blank name here would make a two-video-input consumer blind.
   std::vector<std::string> event_ports;
 };
+
+// ---------------------------------------------------------------------------
+// In-band media format frontier (EVT-4).
+//
+// A producer publishes "media_format_changed" whose detail names the
+// keyframe that starts the new configuration; the scheduler mirrors that
+// publication into a GE_PACKET_FLAG_EVENT Packet placed immediately before
+// that keyframe on every video output edge. See
+// docs/superpowers/specs/2026-09-23-media-format-changed-design.md.
+// ---------------------------------------------------------------------------
+
+// The one event type mirrored into the data plane.
+inline constexpr std::string_view kFormatEventType = "media_format_changed";
+// The detail key that binds an event to its keyframe.
+inline constexpr std::string_view kFormatEventSeqKey = "first_key_seq";
+
+// True when an edge's negotiated contract carries a video format, i.e.
+// the edge is a video data path. Takes the contract rather than the
+// RouteEntry on purpose: RouteEntry lives in runtime_topology.h, which
+// already includes this header (line 16), so naming it here would close
+// an include cycle.
+[[nodiscard]] bool IsVideoRoute(const ConnectionContract& contract);
+
+// The keyframe seq this event binds to; nullopt when the detail carries no
+// usable key (absent, non-numeric, non-positive). Such an event is
+// side-band only.
+[[nodiscard]] std::optional<PacketSeq> FormatEventMatchSeq(const JsonValue& detail);
+
+// Builds the in-band event Packet for |keyframe|: identity fields copied,
+// the event flag set, no payload.
+[[nodiscard]] Packet MakeFormatEventPacket(const Packet& keyframe, std::string_view event_type,
+                                           const JsonValue& detail);
 
 struct AlignedOptions {
   std::int64_t window_ns = 40'000'000;  // ±40ms
