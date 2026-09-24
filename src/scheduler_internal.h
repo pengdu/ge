@@ -101,7 +101,13 @@ class Scheduler::Sink final : public EmitSink, public EventSink {
     const std::vector<RouteEntry>* routes = topo_.RoutesFor(node_.id(), port);
     EmitReport report;
     for (const RouteEntry& r : *routes) {
-      if (video_only && !IsVideoRoute(r.contract)) continue;  // audio/tensor/opaque legs get the keyframe only
+      // A mirrored event travels on video legs only. In the current model
+      // this filter is equivalent to the port-level gate above, because
+      // negotiation assigns one contract per output port
+      // (graph_validator.cpp:282), so all of a port's routes agree on
+      // IsVideoRoute -- the check is kept per-route so the intent survives a
+      // future where per-edge contracts can differ.
+      if (video_only && !IsVideoRoute(r.contract)) continue;
       // Same-edge FIFO: once something is parked for an edge, later packets
       // queue behind it instead of overtaking.
       if (s_.HasParked(node_, *r.edge)) {
