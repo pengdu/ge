@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -65,11 +66,13 @@ inline PortCapability BytesPort(const char* name, PortDirection dir, bool requir
 
 // A video port: carries VideoConstraints, which is what IsVideoRoute() reads.
 inline PortCapability VideoPort(const char* name, PortDirection dir, std::vector<std::string> pf,
-                                PortCardinality card = PortCardinality::kSingle) {
+                                PortCardinality card = PortCardinality::kSingle,
+                                bool required = true) {
   PortCapability p;
   p.name = name;
   p.direction = dir;
   p.type_tag = "VideoFrame";
+  p.required = required;
   p.cardinality = card;
   p.video = VideoConstraints{};
   p.video->pixel_formats = std::move(pf);
@@ -432,34 +435,74 @@ class VideoCountSource final : public Operator {
 // packet's GE_PACKET_FLAG_KEYFRAME: with it false, a packet whose seq matches
 // |detail_seq| still must not consume the candidate, because the binding is
 // keyframe-specific, not seq-specific.
+//
+// Each entry of |hooks| runs once, in order, one immediately before the
+// publish and one immediately before the emit, so a test can change engine
+// state in between -- cancelling the node there makes the *event* push fail
+// while the publication is already staged.
+//
+// |bytes_seq|, when non-zero, emits an opaque "Bytes" packet on a second
+// output port "bytes" first, and |out2_seq| a keyframe on the video sibling
+// "out2". Both are emitted *before* the keyframe on "out", which carries
+// |key_seq|. The order matters: the candidate names |detail_seq|, emitted on
+// "out" last, so an earlier emit on another port must leave it staged. Keying
+// on seq alone would consume it on whichever port matched first.
 class FormatAnnouncer final : public Operator {
  public:
-  explicit FormatAnnouncer(PacketSeq key_seq, PacketSeq detail_seq, bool keyframe = true)
-      : key_seq_(key_seq), detail_seq_(detail_seq), keyframe_(keyframe) {}
+  explicit FormatAnnouncer(PacketSeq key_seq, PacketSeq detail_seq, bool keyframe = true,
+                           std::vector<std::function<void()>> hooks = {}, PacketSeq out2_seq = 0,
+                           PacketSeq bytes_seq = 0)
+      : key_seq_(key_seq),
+        detail_seq_(detail_seq),
+        keyframe_(keyframe),
+        hooks_(std::move(hooks)),
+        out2_seq_(out2_seq),
+        bytes_seq_(bytes_seq) {}
   Status Open(const OpenRequest&) override { return Status::Ok(); }
   Result<ProcessResult> Process(const ProcessRequest& req) override {
     if (req.flags & GE_PROCESS_FLAG_FLUSH) return ProcessResult::kContinue;
     if (done_) return ProcessResult::kExhausted;
     done_ = true;
+    Hook();
     if (req.events != nullptr) {
       JsonObject d;
       d.emplace("first_key_seq", JsonValue(static_cast<std::uint64_t>(detail_seq_)));
       d.emplace("pixel_format", JsonValue("NV12"));
       req.events->Publish("media_format_changed", Severity::kInfo, JsonValue(std::move(d)));
     }
-    Packet p;
-    p.header.seq = key_seq_;
-    p.header.pts_ns = 1000;
-    p.header.flags = keyframe_ ? GE_PACKET_FLAG_KEYFRAME : 0u;
-    p.header.type_tag = TypeTagRegistry::Global().Intern("VideoFrame");
-    return req.sink->Emit("out", std::move(p));
+    if (bytes_seq_ != 0) {
+      if (const Status s = req.sink->Emit("bytes", MakeKeyframe(bytes_seq_, "Bytes")); !s.ok()) {
+        return s;
+      }
+    }
+    if (out2_seq_ != 0) {
+      if (const Status s = req.sink->Emit("out2", MakeKeyframe(out2_seq_)); !s.ok()) return s;
+    }
+    Hook();
+    return req.sink->Emit("out", MakeKeyframe(key_seq_));
   }
   Status Close(const CloseRequest&) override { return Status::Ok(); }
 
  private:
+  Packet MakeKeyframe(PacketSeq seq, const char* tag = "VideoFrame") const {
+    Packet p;
+    p.header.seq = seq;
+    p.header.pts_ns = 1000;
+    p.header.flags = keyframe_ ? GE_PACKET_FLAG_KEYFRAME : 0u;
+    p.header.type_tag = TypeTagRegistry::Global().Intern(tag);
+    return p;
+  }
+  void Hook() {
+    if (next_hook_ < hooks_.size()) hooks_[next_hook_++]();
+  }
+
   PacketSeq key_seq_;
   PacketSeq detail_seq_;
   bool keyframe_;
+  std::vector<std::function<void()>> hooks_;
+  std::size_t next_hook_ = 0;
+  PacketSeq out2_seq_ = 0;
+  PacketSeq bytes_seq_ = 0;
   bool done_ = false;
 };
 
@@ -503,20 +546,42 @@ class EventAwareCollector final : public Operator {
 // that publishes "media_format_changed" bound to |detail_seq| and then emits
 // its keyframe on "out") and "Collect@1.0.0" (an EventAwareCollector on "in").
 // |key_seq| is what the node actually emits, so the two differ whenever a
-// test wants a publication that cannot bind.
+// test wants a publication that cannot bind. |two_video_outputs| gives the
+// announcer a second video port "out2", and |out2_seq| the keyframe it emits
+// on it (the mirror is bound per output port, not per seq, and this is what
+// lets a test prove it). |hooks| reach FormatAnnouncer unchanged.
 inline void RegisterFormatAnnouncerFixture(BuiltinOperatorFactory& factory,
                                            std::vector<std::shared_ptr<Operator>>& keep,
                                            PacketSeq key_seq, PacketSeq detail_seq,
                                            EventAwareCollector** collector,
-                                           bool keyframe = true) {
-  factory.Register(Desc("Announce@1.0.0", {},
-                        {VideoPort("out", PortDirection::kOutput, {"NV12"},
-                                   PortCardinality::kMulti)},
-                        true, 1),
-                   [&keep, key_seq, detail_seq, keyframe](const OperatorCreateArgs&) {
-                     return Keep(keep, std::make_shared<FormatAnnouncer>(key_seq, detail_seq, keyframe));
+                                           bool keyframe = true,
+                                           bool two_video_outputs = false,
+                                           PacketSeq out2_seq = 0,
+                                           std::vector<std::function<void()>> hooks = {},
+                                           bool opaque_output = false,
+                                           PacketSeq bytes_seq = 0) {
+  std::vector<PortCapability> outs{
+      VideoPort("out", PortDirection::kOutput, {"NV12"}, PortCardinality::kMulti)};
+  if (opaque_output) {
+    outs.push_back(BytesPort("bytes", PortDirection::kOutput, false, PortCardinality::kMulti));
+  }
+  if (two_video_outputs) {
+    outs.push_back(VideoPort("out2", PortDirection::kOutput, {"NV12"}, PortCardinality::kMulti));
+  }
+  factory.Register(Desc("Announce@1.0.0", {}, std::move(outs), true, 1),
+                   [&keep, key_seq, detail_seq, keyframe, out2_seq, hooks, bytes_seq](
+                       const OperatorCreateArgs&) {
+                     return Keep(keep, std::make_shared<FormatAnnouncer>(
+                                           key_seq, detail_seq, keyframe, hooks, out2_seq, bytes_seq));
                    });
-  factory.Register(Desc("Collect@1.0.0", {VideoPort("in", PortDirection::kInput, {"NV12"})}, {}),
+  // "in" is required (the video leg of every fixture graph); "in2" is optional
+  // so a two-video test can wire the sibling, and the opaque leg is optional.
+  factory.Register(Desc("Collect@1.0.0",
+                        {VideoPort("in", PortDirection::kInput, {"NV12"}),
+                         VideoPort("in2", PortDirection::kInput, {"NV12"}, PortCardinality::kMulti,
+                                   false),
+                         BytesPort("bytes", PortDirection::kInput, false)},
+                        {}),
                    [&keep, collector](const OperatorCreateArgs&) {
                      auto c = std::make_shared<EventAwareCollector>();
                      *collector = c.get();

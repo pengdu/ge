@@ -43,13 +43,18 @@ class Scheduler::Sink final : public EmitSink, public EventSink {
             pending_.begin(), pending_.end(),
             [&](const PendingFormatEvent& p) { return p.seq == packet.header.seq; });
         if (it != pending_.end()) {
+          // Copy the detail out and push *before* erasing: the candidate is
+          // only consumed once the event Packet is really on its way. A failed
+          // push therefore leaves it staged, so the destructor still counts it
+          // -- erasing first would lose the keyframe and the diagnostic
+          // together, which is the outcome this mirror exists to prevent.
           const JsonValue detail = it->detail;
-          pending_.erase(it);  // one event Packet per keyframe, never two
           if (const Status s = PushOnRoutes(port, MakeFormatEventPacket(packet, kFormatEventType, detail),
                                             /*video_only=*/true);
               !s.ok()) {
             return s;
           }
+          pending_.erase(it);  // one event Packet per keyframe, never two
         }
       }
     }

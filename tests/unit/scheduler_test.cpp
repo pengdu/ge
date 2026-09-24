@@ -817,4 +817,139 @@ TEST(SchedulerTest, FormatEventMirrorsWithoutASideBandSubscriber) {
   EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 0U);
 }
 
+// EVT-4 (Ruling 1): the candidate is bound to the output port whose keyframe
+// matches it, not to the seq alone. The sibling video port emits a keyframe
+// carrying the *bound seq* first, so seq-only keying would consume the
+// candidate there and replay the event onto a port that does not carry the
+// format change. This is the in-task guard for the `video_port` gate.
+TEST(SchedulerTest, SiblingVideoOutputDoesNotGetTheEvent) {
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  EventAwareCollector* sink = nullptr;
+  // The single candidate names seq 7; "out2" emits seq 99, "out" emits 7.
+  RegisterFormatAnnouncerFixture(factory, keep, /*key_seq=*/7, /*detail_seq=*/7, &sink,
+                                 /*keyframe=*/true, /*two_video_outputs=*/true,
+                                 /*out2_seq=*/99);
+  ge::GraphBuilder b("format-sibling-port");
+  auto src = b.AddNode(Op("Announce@1.0.0"), "announce");
+  auto col = b.AddNode(Op("Collect@1.0.0"), "collect");
+  b.Connect(src.port("out"), col.port("in"), {.id = "e0"});
+  b.Connect(src.port("out2"), col.port("in2"), {.id = "e1"});
+  auto r = ge::RuntimeTopology::Build(*b.Build(), factory, {.session_id = 11, .version = 1});
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  auto topo = *r;
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec);
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  ASSERT_NE(sink, nullptr);
+  const std::vector<EventAwareCollector::Entry> got = sink->Entries();
+  ASSERT_EQ(got.size(), 3U) << "sibling keyframe 7, then event(7) and keyframe(7) on 'out'";
+  // Exactly one event Packet, and it arrived on the port that emitted the
+  // bound keyframe -- not on the sibling that emitted the same seq earlier.
+  ASSERT_EQ(std::count_if(got.begin(), got.end(),
+                          [](const EventAwareCollector::Entry& e) { return e.event; }),
+            1);
+  const auto ev = std::find_if(got.begin(), got.end(),
+                               [](const EventAwareCollector::Entry& e) { return e.event; });
+  ASSERT_NE(ev, got.end());
+  EXPECT_EQ(ev->seq, 7U);
+  EXPECT_EQ(ev->port, "in");
+  // Nothing precedes that event: in particular the sibling's keyframe did not
+  // arrive carrying a mirrored event.
+  EXPECT_FALSE(std::any_of(got.begin(), ev,
+                           [](const EventAwareCollector::Entry& e) { return e.event; }))
+      << "the sibling keyframe must not be preceded by an event Packet";
+  EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 0U);
+}
+
+// EVT-4 (Ruling 1): a candidate is consumed only by a keyframe on a port that
+// carries a *video* route. A node with one video and one opaque output that
+// emits the bound seq on the opaque port first must leave the candidate
+// staged: this is the case the `video_port` predicate exists for, and it is
+// the only graph shape that can distinguish the gate from seq-only keying.
+TEST(SchedulerTest, OpaqueOutputDoesNotConsumeTheCandidate) {
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  EventAwareCollector* sink = nullptr;
+  // Candidate names seq 7. "bytes" (opaque) emits seq 7 first; "out" (video)
+  // emits the bound seq 7 afterwards.
+  RegisterFormatAnnouncerFixture(factory, keep, /*key_seq=*/7, /*detail_seq=*/7, &sink,
+                                 /*keyframe=*/true, /*two_video_outputs=*/false,
+                                 /*out2_seq=*/0, /*hooks=*/{},
+                                 /*opaque_output=*/true, /*bytes_seq=*/7);
+  ge::GraphBuilder b("format-opaque-port");
+  auto src = b.AddNode(Op("Announce@1.0.0"), "announce");
+  auto col = b.AddNode(Op("Collect@1.0.0"), "collect");
+  b.Connect(src.port("out"), col.port("in"), {.id = "e0"});
+  b.Connect(src.port("bytes"), col.port("bytes"), {.id = "e1"});
+  auto r = ge::RuntimeTopology::Build(*b.Build(), factory, {.session_id = 11, .version = 1});
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  auto topo = *r;
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec);
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  ASSERT_NE(sink, nullptr);
+  const std::vector<EventAwareCollector::Entry> got = sink->Entries();
+  ASSERT_EQ(got.size(), 3U) << "opaque keyframe 7, then event(7) and keyframe(7) on 'out'";
+  // The opaque port's keyframe did not swallow the candidate: the mirror
+  // still reached the video port, which is what emitted the bound keyframe.
+  ASSERT_EQ(std::count_if(got.begin(), got.end(),
+                          [](const EventAwareCollector::Entry& e) { return e.event; }),
+            1);
+  const auto ev = std::find_if(got.begin(), got.end(),
+                               [](const EventAwareCollector::Entry& e) { return e.event; });
+  ASSERT_NE(ev, got.end());
+  EXPECT_EQ(ev->seq, 7U);
+  EXPECT_EQ(ev->port, "in");
+  EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 0U);
+}
+
+// EVT-4 (Critical 1): a staged candidate is consumed only once its event
+// Packet is really pushed. If that push fails the keyframe behind it is not
+// delivered and the candidate stays staged, so the call-end counter still
+// reports it -- an unmatched binding must never be both lost and uncounted.
+TEST(SchedulerTest, FailedEventPushKeepsTheCandidateCounted) {
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  EventAwareCollector* sink = nullptr;
+  ge::RuntimeTopology* topo_ptr = nullptr;
+  // The second hook runs after the publication is staged and before the
+  // keyframe emit; fast-retiring the node makes PacketRouter::Prepare reject
+  // the event Packet with kCancelled. That is the reachable way a push on a
+  // live invocation fails.
+  std::vector<std::function<void()>> hooks{[] {},
+                                           [&topo_ptr] {
+                                             ge::NodeRuntime& n = *topo_ptr->FindNode("announce");
+                                             n.MarkCancelled();
+                                           }};
+  RegisterFormatAnnouncerFixture(factory, keep, /*key_seq=*/7, /*detail_seq=*/7, &sink,
+                                 /*keyframe=*/true, /*two_video_outputs=*/false,
+                                 /*out2_seq=*/0, std::move(hooks));
+  ge::GraphBuilder b("format-push-failure");
+  auto src = b.AddNode(Op("Announce@1.0.0"), "announce");
+  auto col = b.AddNode(Op("Collect@1.0.0"), "collect");
+  b.Connect(src.port("out"), col.port("in"), {.id = "e0"});
+  auto r = ge::RuntimeTopology::Build(*b.Build(), factory, {.session_id = 11, .version = 1});
+  ASSERT_TRUE(r.ok()) << r.status().ToString();
+  auto topo = *r;
+  topo_ptr = topo.get();
+  ge::ExecutorPool exec(0);
+  ge::Scheduler s(topo, exec);
+  ASSERT_TRUE(s.OpenAll().ok());
+  s.Start();
+  while (exec.RunPending()) {
+  }
+  ASSERT_NE(sink, nullptr);
+  // The event push failed, so the keyframe behind it was not emitted either.
+  EXPECT_EQ(sink->Entries().size(), 0U) << "a failed event push must skip the keyframe";
+  // ...and the candidate it was binding is still counted as unmirrored.
+  EXPECT_EQ(topo->FindNode("announce")->metrics().format_events_unmirrored.load(), 1U);
+}
+
 }  // namespace
