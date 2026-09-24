@@ -155,7 +155,12 @@ In `src/scheduler_invoke.cpp`, replace `MoveBatchInto` (and the comment above it
 template <typename Ports>
 void MoveBatchInto(InputBatch& batch, Ports& ports, std::vector<PacketRef>& inputs) {
   for (std::size_t i = 0; i < batch.events.size(); ++i) {
-    ports.push_back(i < batch.event_ports.size() ? batch.event_ports[i] : std::string{});
+    // Bind to a local first: at the async call site |ports| is a
+    // vector<string_view>, and the ternary's two branches differ in value
+    // category, so pushing it directly dangles (-Wdangling-capture).
+    const std::string name =
+        i < batch.event_ports.size() ? batch.event_ports[i] : std::string{};
+    ports.push_back(name);
     inputs.push_back(std::move(batch.events[i]));
   }
   for (std::size_t i = 0; i < batch.packets.size(); ++i) {
