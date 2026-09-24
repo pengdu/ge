@@ -196,6 +196,9 @@ void RenderSessionMetrics(PrometheusWriter& w, const Session& session) {
     w.Counter("node_errors_total", "Failed invocations", nl, m.errors.load(std::memory_order_relaxed));
     w.Counter("node_would_block_total", "Emits that hit a full block-policy edge", nl,
               m.would_block.load(std::memory_order_relaxed));
+    w.Counter("node_format_events_unmirrored_total",
+              "Format events published without a binding keyframe (side-band only)", nl,
+              m.format_events_unmirrored.load(std::memory_order_relaxed));
     w.Gauge("node_in_flight", "Invocations currently running", nl, static_cast<double>(n->in_flight()));
     w.Histogram("node_process_seconds", "Synchronous Process call latency", nl, m.process_latency);
     if (n->is_async()) {

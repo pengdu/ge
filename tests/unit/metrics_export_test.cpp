@@ -4,6 +4,10 @@
 
 #include <string>
 
+#include <ge/cpp/session.h>
+
+#include "test_operators.h"
+
 namespace {
 
 using ge::LatencyHistogram;
@@ -52,6 +56,43 @@ TEST(PrometheusWriterTest, EscapesLabelValues) {
   PrometheusWriter w;
   w.Gauge("g", "h", "", 1);
   EXPECT_EQ(w.Finish(), "# HELP ge_g h\n# TYPE ge_g gauge\nge_g 1\n");
+}
+
+// EVT-4 / OBS-1: a staged format event that never found its binding keyframe
+// increments NodeMetrics::format_events_unmirrored; the exposition must carry
+// it so the side-band-only publications are visible instead of silent.
+TEST(MetricsExportTest, UnmirroredFormatEventsAreExported) {
+  using namespace ge::test;
+  std::shared_ptr<ge::HostBufferPool> pool = ge::HostBufferPool::Create();
+  ge::BuiltinOperatorFactory factory;
+  std::vector<std::shared_ptr<ge::Operator>> keep;
+  factory.Register(Desc("Src@1.0.0", {},
+                        {BytesPort("out", ge::PortDirection::kOutput, true, ge::PortCardinality::kMulti)},
+                        true, 1),
+                   [&](const ge::OperatorCreateArgs&) {
+                     return Keep(keep, std::make_shared<CountingSource>(1, pool));
+                   });
+  ge::ExecutorPool exec(0);
+  ge::OperationRegistry ops;
+  ge::SessionOptions so;
+  so.coordinator_thread = false;
+  ge::GraphBuilder b("unmirrored");
+  b.AddNode(*ge::OperatorKey::Parse("Src@1.0.0"), "announce");
+  auto spec = b.Build();
+  ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+  auto session = ge::Session::Create(*spec, factory, exec, ops, so);
+  ASSERT_TRUE(session.ok()) << session.status().ToString();
+  ge::NodeRuntime* node = (*session)->current_topology()->FindNode("announce");
+  ASSERT_NE(node, nullptr);
+  node->metrics().format_events_unmirrored.store(3, std::memory_order_relaxed);
+  PrometheusWriter w("t_");
+  ge::RenderSessionMetrics(w, **session);
+  const std::string out = w.Finish();
+  EXPECT_NE(out.find("t_node_format_events_unmirrored_total{"), std::string::npos) << out;
+  EXPECT_NE(out.find("t_node_format_events_unmirrored_total{session=\"1\",node=\"announce\","
+                     "op=\"Src@1.0.0\"} 3\n"),
+            std::string::npos)
+      << out;
 }
 
 }  // namespace
