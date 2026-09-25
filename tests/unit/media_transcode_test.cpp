@@ -854,3 +854,133 @@ TEST(MediaTranscodeTest, ThreadedRealtimeDrawtextToggle) {
   }
   EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
 }
+
+// ---------------------------------------------------------------------------
+// Encoded passthrough (remux): demux -> mux, no decode/encode in between.
+// Spec: docs/superpowers/specs/2026-09-23-encoded-passthrough-remux-design.md
+// ---------------------------------------------------------------------------
+
+namespace {
+
+ge::Result<ge::GraphSpec> BuildRemuxGraph(const std::string& input, const std::string& output,
+                                          const char* container, bool audio) {
+  ge::GraphBuilder b("remux");
+  const ge::NodeRef demux = b.AddNode(*ge::OperatorKey::Parse(kOpMediaDemux), "demux",
+                                      ge::JsonValue(ge::JsonObject{{"input_path", ge::JsonValue(input)}}));
+  const ge::NodeRef mux = b.AddNode(*ge::OperatorKey::Parse(kOpMediaMux), "mux",
+                                    ge::JsonValue(ge::JsonObject{{"output_path", ge::JsonValue(output)},
+                                                                 {"container", ge::JsonValue(container)},
+                                                                 // Remux preserves the source streams verbatim;
+                                                                 // align_start trimming is for renditions that
+                                                                 // start mid-stream, not for passthrough.
+                                                                 {"align_start", ge::JsonValue(false)}}));
+  b.Connect(demux.port("video"), mux.port("video"));
+  if (audio) b.Connect(demux.port("audio"), mux.port("audio"));
+  return b.Build();
+}
+
+// Remux keeps the source packet order and spacing. The absolute timeline
+// may shift by a constant: a B-frame source has a negative first dts and
+// the target muxer shifts the whole stream to dts >= 0 (same as ffmpeg's
+// avoid_negative_ts on -c copy). Compare pts relative to the first packet.
+void ExpectPtsEqual(const std::vector<std::int64_t>& out, const std::vector<std::int64_t>& src) {
+  ASSERT_EQ(out.size(), src.size());
+  if (out.empty()) return;
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    EXPECT_LE(std::llabs((out[i] - out[0]) - (src[i] - src[0])), 1) << "packet " << i;
+  }
+}
+
+void RunRemux(Fixture& f, const std::string& input, const std::string& output, const char* container,
+              bool audio = true) {
+  auto g = BuildRemuxGraph(input, output, container, audio);
+  ASSERT_TRUE(g.ok()) << g.status().ToString();
+  auto s = f.engine->CreateSession(*g);
+  ASSERT_TRUE(s.ok()) << s.status().ToString();
+  ge::Session* session = *s;
+  ASSERT_TRUE(session->Start().ok());
+  ASSERT_TRUE(f.RunToStop(session)) << session->Snapshot().Serialize();
+  EXPECT_EQ(session->state(), ge::SessionState::kStopped) << session->failure().ToString();
+  EXPECT_TRUE(f.engine->DestroySession(session->id()).ok());
+}
+
+}  // namespace
+
+TEST(MediaRemuxTest, PassthroughFlvToMp4KeepsEveryFrameAndDuration) {
+  Fixture f("remux_flv_mp4", 60);
+  // The fixture sample is mp4; remux needs an flv source for this direction.
+  const std::string flv_in = (f.dir / "in.flv").string();
+  SampleSpec spec;
+  spec.path = flv_in;
+  spec.frames = 60;
+  spec.fps = 30;
+  spec.gop = 30;
+  auto gen = GenerateSample(spec);
+  ASSERT_TRUE(gen.ok()) << gen.status().ToString();
+  const ProbeResult src = Probe(flv_in);
+
+  const std::string out = f.Out("remux", "mp4");
+  RunRemux(f, flv_in, out, "mp4");
+
+  const ProbeResult p = Probe(out);
+  EXPECT_EQ(p.video_codec, src.video_codec);   // copied, not re-encoded
+  EXPECT_EQ(p.audio_codec, src.audio_codec);
+  EXPECT_EQ(p.video_packets, src.video_packets);
+  EXPECT_EQ(p.audio_packets, src.audio_packets);  // align_start trims nothing on an aligned sample
+  EXPECT_TRUE(p.first_video_is_key);
+  EXPECT_TRUE(p.read_to_eof);
+  EXPECT_TRUE(p.trailer_ok);
+  ExpectPtsEqual(p.video_pts_ms, src.video_pts_ms);
+  // The last sample only survives the MP4 edit list when the packet
+  // duration made it across; that needs pkt->time_base from the demuxer.
+  if (const auto n = FfprobeVideoFrames(out)) EXPECT_EQ(*n, 60);
+  EXPECT_LE(std::llabs(p.duration_ms - src.duration_ms), 1000 / 30 + 1);
+}
+
+TEST(MediaRemuxTest, PassthroughMp4ToFlvKeepsStreamsIntact) {
+  Fixture f("remux_mp4_flv", 60);
+  const ProbeResult src = Probe(f.input);
+  const std::string out = f.Out("remux", "flv");
+  RunRemux(f, f.input, out, "flv");
+
+  const ProbeResult p = Probe(out);
+  EXPECT_EQ(p.video_codec, src.video_codec);
+  EXPECT_EQ(p.audio_codec, src.audio_codec);
+  EXPECT_EQ(p.video_packets, src.video_packets);
+  EXPECT_EQ(p.audio_packets, src.audio_packets);
+  EXPECT_TRUE(p.first_video_is_key);
+  EXPECT_TRUE(p.read_to_eof);
+  EXPECT_TRUE(p.trailer_ok);
+  ExpectPtsEqual(p.video_pts_ms, src.video_pts_ms);
+}
+
+TEST(MediaRemuxTest, PassthroughMp4ToMkvKeepsStreamsIntact) {
+  Fixture f("remux_mp4_mkv", 60);
+  const ProbeResult src = Probe(f.input);
+  const std::string out = f.Out("remux", "mkv");
+  RunRemux(f, f.input, out, "matroska");
+
+  const ProbeResult p = Probe(out);
+  EXPECT_EQ(p.video_codec, src.video_codec);
+  EXPECT_EQ(p.audio_codec, src.audio_codec);
+  EXPECT_EQ(p.video_packets, src.video_packets);
+  EXPECT_EQ(p.audio_packets, src.audio_packets);
+  EXPECT_TRUE(p.read_to_eof);
+  EXPECT_TRUE(p.trailer_ok);
+  ExpectPtsEqual(p.video_pts_ms, src.video_pts_ms);
+}
+
+TEST(MediaRemuxTest, VideoOnlyPassthroughDropsAudioAtTheDemuxer) {
+  Fixture f("remux_vonly", 60);
+  const ProbeResult src = Probe(f.input);
+  const std::string out = f.Out("remux", "flv");
+  RunRemux(f, f.input, out, "flv", /*audio=*/false);
+
+  const ProbeResult p = Probe(out);
+  EXPECT_EQ(p.video_packets, src.video_packets);
+  EXPECT_EQ(p.audio_packets, 0);
+  EXPECT_TRUE(p.first_video_is_key);
+  EXPECT_TRUE(p.read_to_eof);
+  EXPECT_TRUE(p.trailer_ok);
+  ExpectPtsEqual(p.video_pts_ms, src.video_pts_ms);
+}

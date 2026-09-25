@@ -71,3 +71,4 @@ Testing/
 CTestTestfile.cmake
 DartConfiguration.tcl
 .brooks-lint-history.json
+docs/superpowers/

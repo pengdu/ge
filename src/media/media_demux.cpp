@@ -98,6 +98,7 @@ class MediaDemux final : public Operator {
       std::uint32_t flags = 0;
       if (pkt->flags & AV_PKT_FLAG_KEY) flags |= GE_PACKET_FLAG_KEYFRAME;
       const PacketSeq seq = is_video ? ++video_seq_ : ++audio_seq_;
+      pkt->time_base = st->time_base;
       Packet out = MakePacket(WrapPacket(std::move(pkt)), Tag(is_video ? kTagEncodedVideo : kTagEncodedAudio), seq,
                               pts_ns, dts_ns, flags);
       // The first packet of each stream (and every keyframe) carries the
