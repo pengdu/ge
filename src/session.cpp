@@ -6,6 +6,8 @@
 
 #include <ge/cpp/graph_spec_json.h>
 
+#include "mutation_coordinator.h"
+
 namespace ge {
 
 std::string_view ToString(SessionState s) noexcept {
@@ -545,7 +547,7 @@ Session::Session(std::shared_ptr<RuntimeTopology> topology, OperatorFactory& fac
                          events_.on_operator_event(n, std::move(type), sev, std::move(detail));
                        }
                      }}),
-      coordinator_(*this, factory, operations) {
+      coordinator_(std::make_unique<MutationCoordinator>(*this, factory, operations)) {
   if (AsyncRuntime* rt = options_.async_runtime; rt != nullptr) {
     AsyncSessionHooks hooks;
     hooks.after_emit = [this](const EmitReport& r) { scheduler_.OnAsyncEmit(r); };
@@ -570,8 +572,8 @@ Session::Session(std::shared_ptr<RuntimeTopology> topology, OperatorFactory& fac
 }
 
 Session::~Session() {
-  coordinator_.StopThread();
-  coordinator_.CancelAll("session destroyed");
+  coordinator_->StopThread();
+  coordinator_->CancelAll("session destroyed");
   const SessionState s = state();
   if (s != SessionState::kStopped && s != SessionState::kCreated) {
     scheduler_.Stop(true);
@@ -611,7 +613,7 @@ Status Session::Start() {
   }
   Transition(SessionState::kRunning);
   scheduler_.Start();
-  if (options_.coordinator_thread) coordinator_.StartThread();
+  if (options_.coordinator_thread) coordinator_->StartThread();
   return Status::Ok();
 }
 
@@ -670,7 +672,7 @@ Result<OperationId> Session::Stop(bool fast, CallerContext caller) {
     stop_waiters_.push_back(op);
   }
   operations_.SetRunning(op);
-  coordinator_.CancelAll("session stopping");
+  coordinator_->CancelAll("session stopping");
   if (scheduler_.all_closed()) {
     OnAllClosed();
   } else {
@@ -722,7 +724,7 @@ void Session::OnNodeFailed(NodeRuntime& node, const Status& status) {
   failure_ = Status(status.code(),
                     "node '" + node.external_id() + "' failed: " + status.message(), false,
                     status.context_json());
-  coordinator_.CancelAll("session failed");
+  coordinator_->CancelAll("session failed");
   scheduler_.Stop(true);
 }
 
@@ -739,14 +741,16 @@ Result<OperationId> Session::Apply(MutationPatch patch, CallerContext caller) {
     operations_.Fail(op, st);
     return st;
   }
-  coordinator_.Submit(MutationRequest{op, std::move(patch)});
+  coordinator_->Submit(MutationRequest{op, std::move(patch)});
   return op;
 }
 
 Result<DryRunResult> Session::DryRun(const MutationPatch& patch) const {
   if (!AcceptsMutations()) return NotMutable();
-  return coordinator_.DryRun(*current_topology(), patch);
+  return coordinator_->DryRun(*current_topology(), patch);
 }
+
+bool Session::PumpMutations() { return coordinator_->Pump(); }
 
 Result<ParameterUpdate> Session::SetParameters(std::string_view node_id, JsonValue parameters,
                                                CallerContext caller) {

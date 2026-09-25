@@ -5,21 +5,17 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <ge/cpp/async_runtime.h>
 #include <ge/cpp/graph_diff.h>
 #include <ge/cpp/graph_spec.h>
 #include <ge/cpp/graph_validator.h>
-#include <ge/cpp/mutation_applier.h>
 #include <ge/cpp/operation.h>
 #include <ge/cpp/operator.h>
 #include <ge/cpp/resource_ledger.h>
@@ -69,11 +65,6 @@ struct SessionEvents {
   std::function<void(NodeRuntime&, std::string type, Severity, JsonValue detail)> on_operator_event;
 };
 
-struct MutationRequest {
-  OperationId operation = 0;
-  MutationPatch patch;
-};
-
 // MUT-7 dry-run: A2–A5 without touching the running graph.
 struct DryRunResult {
   GraphSpec candidate;
@@ -89,65 +80,9 @@ struct ParameterUpdate {
 };
 
 class Session;
-
-// Prepare never touches the running graph; Publish is the atomic swap;
-// operation.
-class MutationCoordinator final {
- public:
-  MutationCoordinator(Session& session, OperatorFactory& factory, OperationRegistry& operations);
-  ~MutationCoordinator();
-
-  // Enqueue (FIFO). The operation is already registered as accepted.
-  void Submit(MutationRequest request);
-  // calling thread. Returns false if the queue was empty. Must not be called
-  // from an executor thread.
-  bool Pump();
-  void StartThread();
-  void StopThread();
-  // Rejects every queued request (session stopping).
-  void CancelAll(std::string reason);
-  [[nodiscard]] Result<DryRunResult> DryRun(const RuntimeTopology& base, const MutationPatch& patch) const;
-
- private:
-  struct Merged {
-    std::vector<MutationRequest> origins;
-    MutationPatch patch;  // concatenated actions
-  };
-  struct Prepared {
-    std::shared_ptr<RuntimeTopology> candidate;
-    CandidateSpec changes;
-    GraphDiff diff;
-    RemovePolicy policy = RemovePolicy::kDrain;
-    // A6: estimate of the nodes/edges this version adds (reserved before
-    // warm-up, returned if warm-up or publish fails) and of the ones it
-    // removes (returned when the retire completes).
-    std::vector<ResourceAmount> added;
-    std::vector<ResourceAmount> removed;
-  };
-
-  Merged TakeBatch();  // queue_mutex_ held by caller? no: locks internally
-  void Execute(Merged batch);
-  [[nodiscard]] Result<CandidateSpec> ApplyPatch(const RuntimeTopology& base,
-                                                 const MutationPatch& patch) const;
-  [[nodiscard]] Result<Prepared> Prepare(const RuntimeTopology& base, const MutationPatch& patch,
-                                         TopologyVersion version);
-  void MigrateParameters(const RuntimeTopology& base, const MutationPatch& patch,
-                         GraphSpec* candidate) const;
-  [[nodiscard]] static bool Disjoint(const CandidateSpec& a, const CandidateSpec& b);
-  void FailAll(const Merged& batch, const Status& status, const std::string& action_detail);
-  void Loop();
-
-  Session& session_;
-  OperatorFactory& factory_;
-  OperationRegistry& operations_;
-  MutationApplier applier_;
-  mutable std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
-  std::deque<MutationRequest> queue_;
-  std::thread thread_;
-  bool stop_thread_ = false;  // guarded by queue_mutex_
-  std::mutex execute_mutex_;  // one Execute at a time (Pump vs thread)
-};
+// Private to ge_core (src/mutation_coordinator.h): the mutation pipeline is
+// driven through Session::Apply / DryRun / PumpMutations only.
+class MutationCoordinator;
 
 // MutationQueue, RetiredTopologyList (inside Scheduler) and parameter
 class Session final {
@@ -177,7 +112,7 @@ class Session final {
   [[nodiscard]] Result<OperationId> Apply(MutationPatch patch, CallerContext caller = {});
   [[nodiscard]] Result<DryRunResult> DryRun(const MutationPatch& patch) const;
   // Host-side pump when SessionOptions::coordinator_thread == false.
-  bool PumpMutations() { return coordinator_.Pump(); }
+  bool PumpMutations();
 
   [[nodiscard]] Result<ParameterUpdate> SetParameters(std::string_view node_id, JsonValue parameters,
                                                       CallerContext caller = {});
@@ -221,7 +156,7 @@ class Session final {
   mutable std::mutex lease_mutex_;
   ResourceLease lease_;  // guarded by lease_mutex_; amounts() == everything live
   Scheduler scheduler_;
-  MutationCoordinator coordinator_;
+  std::unique_ptr<MutationCoordinator> coordinator_;
   std::shared_ptr<SessionCompletionSink> sink_;
   std::atomic<SessionState> state_{SessionState::kCreated};
   Status failure_;
