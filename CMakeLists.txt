@@ -99,6 +99,7 @@ add_library (
   src/graph_template.cpp
   src/batch_runner.cpp
   src/capability.cpp
+  src/capability_json.cpp
   src/graph_validator.cpp
   src/graph_diff.cpp
   src/plugin_manifest.cpp
